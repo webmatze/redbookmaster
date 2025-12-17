@@ -1099,12 +1099,20 @@ fn play_transition(project: &Project) {
     println!("{} Transition preview complete!", "✓".green());
 }
 
-/// Export master (placeholder)
+/// Export master - generate CUE sheet, WAV, and TOC files
 fn export_master(project: &Project) {
+    use indicatif::{ProgressBar, ProgressStyle};
+
     println!();
     println!("{}", "Export Master".bold().green());
     println!("{}", "─".repeat(40).dimmed());
     println!();
+
+    // Check for empty project
+    if project.album.tracks.is_empty() {
+        println!("{} No tracks to export. Add tracks first.", "✗".red());
+        return;
+    }
 
     // Validate first
     match project.album.validate() {
@@ -1118,12 +1126,181 @@ fn export_master(project: &Project) {
         }
     }
 
-    println!("{} Export not yet implemented", "⚠".yellow());
+    // Check that all source files exist and are Red Book compliant
     println!();
-    println!("Would export:");
-    println!("  - {}.cue (CUE sheet with CD-TEXT)", project.name());
-    println!("  - {}.wav (concatenated audio)", project.name());
-    println!("  - {}.toc (cdrdao TOC file)", project.name());
+    println!("Checking source files...");
+    for track in &project.album.tracks {
+        if !track.source_file.exists() {
+            println!(
+                "{} Source file missing: {:?}",
+                "✗".red(),
+                track.source_file
+            );
+            return;
+        }
+
+        match crate::audio::wav::read_wav_info(&track.source_file) {
+            Ok(info) => {
+                if !info.is_red_book_compliant() {
+                    println!(
+                        "{} Track {} is not Red Book compliant: {}",
+                        "✗".red(),
+                        track.number,
+                        info.format_issues().join(", ")
+                    );
+                    println!("Please convert the file first using 'Add tracks'.");
+                    return;
+                }
+            }
+            Err(e) => {
+                println!(
+                    "{} Cannot read track {}: {}",
+                    "✗".red(),
+                    track.number,
+                    e
+                );
+                return;
+            }
+        }
+    }
+    println!("{} All source files OK", "✓".green());
+
+    // Choose export format
+    println!();
+    let format_options = vec![
+        "Single WAV + CUE (recommended for burning)",
+        "Multi-file CUE (references original WAV files)",
+    ];
+
+    let format_selection = match Select::new("Export format:", format_options).prompt() {
+        Ok(s) => s,
+        Err(_) => return,
+    };
+
+    let single_wav_mode = format_selection.starts_with("Single");
+
+    // Get output directory
+    let default_dir = project
+        .file_path
+        .as_ref()
+        .and_then(|p| p.parent())
+        .map(|p| p.to_string_lossy().to_string())
+        .unwrap_or_else(|| ".".to_string());
+
+    let output_dir = match Text::new("Output directory:")
+        .with_default(&default_dir)
+        .with_help_message("Directory where export files will be saved")
+        .prompt()
+    {
+        Ok(d) => PathBuf::from(d.trim()),
+        Err(_) => return,
+    };
+
+    // Create output directory if needed
+    if !output_dir.exists() {
+        if let Err(e) = std::fs::create_dir_all(&output_dir) {
+            println!("{} Failed to create directory: {}", "✗".red(), e);
+            return;
+        }
+    }
+
+    // Generate base filename
+    let base_name = project.name();
+    let cue_path = output_dir.join(format!("{}.cue", base_name));
+    let toc_path = output_dir.join(format!("{}.toc", base_name));
+    let wav_path = output_dir.join(format!("{}.wav", base_name));
+
+    println!();
+    println!("{}", "Exporting...".bold());
+
+    if single_wav_mode {
+        // Export single concatenated WAV + CUE + TOC
+
+        // 1. Concatenate tracks into single WAV
+        let pb = ProgressBar::new_spinner();
+        pb.set_style(
+            ProgressStyle::default_spinner()
+                .template("{spinner:.green} {msg}")
+                .unwrap(),
+        );
+        pb.set_message("Concatenating audio tracks...");
+        pb.enable_steady_tick(std::time::Duration::from_millis(100));
+
+        match crate::audio::concat::concatenate_tracks(&project.album.tracks, &wav_path) {
+            Ok(()) => {
+                pb.finish_and_clear();
+                println!("{} Created: {}", "✓".green(), wav_path.display());
+            }
+            Err(e) => {
+                pb.finish_and_clear();
+                println!("{} Failed to concatenate audio: {}", "✗".red(), e);
+                return;
+            }
+        }
+
+        // 2. Generate CUE sheet
+        let wav_filename = wav_path
+            .file_name()
+            .and_then(|s| s.to_str())
+            .unwrap_or("master.wav");
+
+        match crate::export::cue::generate_cue(&project.album, wav_filename, &cue_path) {
+            Ok(()) => {
+                println!("{} Created: {}", "✓".green(), cue_path.display());
+            }
+            Err(e) => {
+                println!("{} Failed to generate CUE: {}", "✗".red(), e);
+                return;
+            }
+        }
+
+        // 3. Generate TOC file
+        match crate::export::toc::generate_toc(&project.album, wav_filename, &toc_path) {
+            Ok(()) => {
+                println!("{} Created: {}", "✓".green(), toc_path.display());
+            }
+            Err(e) => {
+                println!("{} Failed to generate TOC: {}", "✗".red(), e);
+                return;
+            }
+        }
+    } else {
+        // Multi-file mode - just generate CUE referencing original files
+        match crate::export::cue::generate_cue_multi(&project.album, &cue_path) {
+            Ok(()) => {
+                println!("{} Created: {}", "✓".green(), cue_path.display());
+            }
+            Err(e) => {
+                println!("{} Failed to generate CUE: {}", "✗".red(), e);
+                return;
+            }
+        }
+    }
+
+    // Summary
+    println!();
+    println!("{}", "Export complete!".bold().green());
+    println!();
+    println!("Files created:");
+    if single_wav_mode {
+        println!("  - {} (concatenated audio)", wav_path.display());
+    }
+    println!("  - {} (CUE sheet with CD-TEXT)", cue_path.display());
+    if single_wav_mode {
+        println!("  - {} (cdrdao TOC file)", toc_path.display());
+    }
+    println!();
+
+    if single_wav_mode {
+        println!("To burn with cdrdao:");
+        println!(
+            "  cdrdao write --device /dev/cdrom {}",
+            toc_path.display()
+        );
+    } else {
+        println!("Note: Multi-file CUE requires all source WAV files to be present.");
+        println!("For CD burning, use 'Single WAV + CUE' format.");
+    }
 }
 
 /// Validate project
