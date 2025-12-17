@@ -417,8 +417,8 @@ pub fn project_menu(mut project: Project) {
             Ok("Reorder tracks") => reorder_tracks(&mut project),
             Ok("Configure gaps") => configure_gaps(&mut project),
             Ok("Play preview") => play_preview(&project),
-            Ok("Export master") => export_master(&project),
-            Ok("Burn CD") => burn_cd(&project),
+            Ok("Export master") => export_master(&mut project),
+            Ok("Burn CD") => burn_cd(&mut project),
             Ok("Validate") => validate_project(&project),
             Ok("Save") => {
                 match project.save() {
@@ -1102,7 +1102,7 @@ fn play_transition(project: &Project) {
 }
 
 /// Export master - generate CUE sheet, WAV, and TOC files
-fn export_master(project: &Project) {
+fn export_master(project: &mut Project) {
     use indicatif::{ProgressBar, ProgressStyle};
 
     println!();
@@ -1181,12 +1181,18 @@ fn export_master(project: &Project) {
 
     let single_wav_mode = format_selection.starts_with("Single");
 
-    // Get output directory
+    // Get output directory - use saved export_dir if available
     let default_dir = project
-        .file_path
+        .export_dir
         .as_ref()
-        .and_then(|p| p.parent())
         .map(|p| p.to_string_lossy().to_string())
+        .or_else(|| {
+            project
+                .file_path
+                .as_ref()
+                .and_then(|p| p.parent())
+                .map(|p| p.to_string_lossy().to_string())
+        })
         .unwrap_or_else(|| ".".to_string());
 
     let output_dir = match Text::new("Output directory:")
@@ -1299,6 +1305,17 @@ fn export_master(project: &Project) {
             "  cdrdao write --device /dev/cdrom {}",
             toc_path.display()
         );
+
+        // Save export directory to project for future use
+        project.export_dir = Some(output_dir.clone());
+
+        // Auto-save project to remember export location
+        if project.file_path.is_some() {
+            match project.save() {
+                Ok(()) => println!("{} Project saved with export location", "✓".green()),
+                Err(e) => println!("{} Could not save project: {}", "⚠".yellow(), e),
+            }
+        }
     } else {
         println!("Note: Multi-file CUE requires all source WAV files to be present.");
         println!("For CD burning, use 'Single WAV + CUE' format.");
@@ -1306,7 +1323,7 @@ fn export_master(project: &Project) {
 }
 
 /// Burn CD using cdrdao
-fn burn_cd(project: &Project) {
+fn burn_cd(project: &mut Project) {
     use crate::burn::cdrdao::{self, BurnOptions, Cdrdao, CdDrive};
 
     println!();
@@ -1349,20 +1366,31 @@ fn burn_cd(project: &Project) {
     }
 
     // Check if we have an exported TOC file
+    // First check the saved export directory, then fall back to project directory
     let toc_path = project
-        .file_path
-        .as_ref()
-        .and_then(|p| p.parent())
-        .map(|dir| dir.join(format!("{}.toc", project.name())))
-        .filter(|p| p.exists());
+        .toc_path()
+        .filter(|p| p.exists())
+        .or_else(|| {
+            // Fallback: check next to project file
+            project
+                .file_path
+                .as_ref()
+                .and_then(|p| p.parent())
+                .map(|dir| dir.join(format!("{}.toc", project.name())))
+                .filter(|p| p.exists())
+        });
 
     let toc_file = match toc_path {
         Some(path) => {
-            println!("{} Found TOC file: {}", "✓".green(), path.display());
+            println!("{} Found exported master:", "✓".green());
+            println!("  TOC: {}", path.display());
+            if let Some(wav) = project.wav_path().filter(|p| p.exists()) {
+                println!("  WAV: {}", wav.display());
+            }
             path
         }
         None => {
-            println!("{} No TOC file found.", "⚠".yellow());
+            println!("{} No exported master found.", "⚠".yellow());
             println!("Please export the master first using 'Export master' -> 'Single WAV + CUE'.");
             println!();
 
@@ -1373,12 +1401,9 @@ fn burn_cd(project: &Project) {
             if matches!(export_now, Ok(true)) {
                 export_master(project);
 
-                // Check again for TOC file
+                // Check again for TOC file using saved export_dir
                 let new_toc = project
-                    .file_path
-                    .as_ref()
-                    .and_then(|p| p.parent())
-                    .map(|dir| dir.join(format!("{}.toc", project.name())))
+                    .toc_path()
                     .filter(|p| p.exists());
 
                 match new_toc {

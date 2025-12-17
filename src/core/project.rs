@@ -8,7 +8,7 @@ use super::Album;
 pub const PROJECT_EXTENSION: &str = "rbm";
 
 /// Current project file version
-pub const PROJECT_VERSION: u32 = 1;
+pub const PROJECT_VERSION: u32 = 2;
 
 /// A Red Book Master project file
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -18,6 +18,10 @@ pub struct Project {
 
     /// The album data
     pub album: Album,
+
+    /// Directory where master was exported (CUE, WAV, TOC files)
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub export_dir: Option<PathBuf>,
 
     /// Path to the project file (not serialized)
     #[serde(skip)]
@@ -30,6 +34,7 @@ impl Project {
         Self {
             version: PROJECT_VERSION,
             album,
+            export_dir: None,
             file_path: None,
         }
     }
@@ -128,6 +133,30 @@ impl Project {
             .and_then(|s| s.to_str())
             .map(|s| s.to_string())
             .unwrap_or_else(|| self.album.title.clone())
+    }
+
+    /// Get the path to the exported TOC file, if it exists
+    pub fn toc_path(&self) -> Option<PathBuf> {
+        self.export_dir.as_ref().map(|dir| dir.join(format!("{}.toc", self.name())))
+    }
+
+    /// Get the path to the exported CUE file, if it exists
+    pub fn cue_path(&self) -> Option<PathBuf> {
+        self.export_dir.as_ref().map(|dir| dir.join(format!("{}.cue", self.name())))
+    }
+
+    /// Get the path to the exported WAV file, if it exists
+    pub fn wav_path(&self) -> Option<PathBuf> {
+        self.export_dir.as_ref().map(|dir| dir.join(format!("{}.wav", self.name())))
+    }
+
+    /// Check if exported master files exist
+    pub fn has_exported_master(&self) -> bool {
+        if let (Some(toc), Some(wav)) = (self.toc_path(), self.wav_path()) {
+            toc.exists() && wav.exists()
+        } else {
+            false
+        }
     }
 }
 
