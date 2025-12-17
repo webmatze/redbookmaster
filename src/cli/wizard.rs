@@ -399,6 +399,7 @@ pub fn project_menu(mut project: Project) {
             "Configure gaps",
             "Play preview",
             "Export master",
+            "Burn CD",
             "Validate",
             "Save",
             "Exit",
@@ -417,6 +418,7 @@ pub fn project_menu(mut project: Project) {
             Ok("Configure gaps") => configure_gaps(&mut project),
             Ok("Play preview") => play_preview(&project),
             Ok("Export master") => export_master(&project),
+            Ok("Burn CD") => burn_cd(&project),
             Ok("Validate") => validate_project(&project),
             Ok("Save") => {
                 match project.save() {
@@ -1300,6 +1302,282 @@ fn export_master(project: &Project) {
     } else {
         println!("Note: Multi-file CUE requires all source WAV files to be present.");
         println!("For CD burning, use 'Single WAV + CUE' format.");
+    }
+}
+
+/// Burn CD using cdrdao
+fn burn_cd(project: &Project) {
+    use crate::burn::cdrdao::{self, BurnOptions, Cdrdao, CdDrive};
+
+    println!();
+    println!("{}", "Burn CD".bold().green());
+    println!("{}", "─".repeat(40).dimmed());
+    println!();
+
+    // Check if cdrdao is available
+    if !cdrdao::is_available() {
+        println!("{} cdrdao is not installed.", "✗".red());
+        println!();
+        println!("cdrdao is required for CD burning. Install it with:");
+        println!("  macOS:  brew install cdrdao");
+        println!("  Ubuntu: sudo apt install cdrdao");
+        println!("  Fedora: sudo dnf install cdrdao");
+        return;
+    }
+
+    // Show cdrdao version
+    if let Some(version) = cdrdao::version() {
+        println!("{} Found: {}", "✓".green(), version);
+    }
+
+    // Check for empty project
+    if project.album.tracks.is_empty() {
+        println!("{} No tracks to burn. Add tracks first.", "✗".red());
+        return;
+    }
+
+    // Validate project
+    match project.album.validate() {
+        Ok(()) => {
+            println!("{} Project is Red Book compliant", "✓".green());
+        }
+        Err(e) => {
+            println!("{} Validation error: {}", "✗".red(), e);
+            println!("Please fix the issues before burning.");
+            return;
+        }
+    }
+
+    // Check if we have an exported TOC file
+    let toc_path = project
+        .file_path
+        .as_ref()
+        .and_then(|p| p.parent())
+        .map(|dir| dir.join(format!("{}.toc", project.name())))
+        .filter(|p| p.exists());
+
+    let toc_file = match toc_path {
+        Some(path) => {
+            println!("{} Found TOC file: {}", "✓".green(), path.display());
+            path
+        }
+        None => {
+            println!("{} No TOC file found.", "⚠".yellow());
+            println!("Please export the master first using 'Export master' -> 'Single WAV + CUE'.");
+            println!();
+
+            let export_now = Confirm::new("Export master now?")
+                .with_default(true)
+                .prompt();
+
+            if matches!(export_now, Ok(true)) {
+                export_master(project);
+
+                // Check again for TOC file
+                let new_toc = project
+                    .file_path
+                    .as_ref()
+                    .and_then(|p| p.parent())
+                    .map(|dir| dir.join(format!("{}.toc", project.name())))
+                    .filter(|p| p.exists());
+
+                match new_toc {
+                    Some(path) => path,
+                    None => {
+                        println!("{} Export cancelled or failed.", "✗".red());
+                        return;
+                    }
+                }
+            } else {
+                return;
+            }
+        }
+    };
+
+    println!();
+
+    // List available CD drives
+    println!("Scanning for CD drives...");
+    let drives = match cdrdao::list_drives() {
+        Ok(d) if !d.is_empty() => d,
+        Ok(_) => {
+            println!("{} No CD drives found.", "✗".red());
+            println!("Make sure a CD burner is connected and recognized by the system.");
+            return;
+        }
+        Err(e) => {
+            println!("{} Failed to scan drives: {}", "⚠".yellow(), e);
+            println!("You can manually specify the device path.");
+
+            // Allow manual device entry
+            let device = match Text::new("CD drive device path:")
+                .with_default("/dev/sr0")
+                .with_help_message("e.g., /dev/sr0, /dev/cdrom, or SCSI address like 0,0,0")
+                .prompt()
+            {
+                Ok(d) => d.trim().to_string(),
+                Err(_) => return,
+            };
+
+            vec![CdDrive {
+                device,
+                vendor: "Unknown".to_string(),
+                model: "Manual entry".to_string(),
+            }]
+        }
+    };
+
+    // Select drive
+    let drive = if drives.len() == 1 {
+        println!("{} Using drive: {} {}", "✓".green(), drives[0].vendor, drives[0].model);
+        &drives[0]
+    } else {
+        let drive_options: Vec<String> = drives
+            .iter()
+            .map(|d| format!("{} - {} {}", d.device, d.vendor, d.model))
+            .collect();
+
+        let selection = match Select::new("Select CD drive:", drive_options.clone()).prompt() {
+            Ok(s) => s,
+            Err(_) => return,
+        };
+
+        let idx = drive_options.iter().position(|o| o == &selection).unwrap_or(0);
+        &drives[idx]
+    };
+
+    // Select burn speed
+    let speed_options = vec![
+        "Auto (let drive decide)",
+        "1x",
+        "2x",
+        "4x",
+        "8x",
+        "16x",
+        "24x",
+        "48x",
+    ];
+
+    let speed_selection = match Select::new("Burn speed:", speed_options)
+        .with_help_message("Lower speeds are more reliable")
+        .prompt()
+    {
+        Ok(s) => s,
+        Err(_) => return,
+    };
+
+    let speed: u32 = match speed_selection {
+        "Auto (let drive decide)" => 0,
+        s => s.trim_end_matches('x').parse().unwrap_or(0),
+    };
+
+    // Ask about simulation
+    let simulate_first = match Confirm::new("Simulate burn first (dry run)?")
+        .with_default(true)
+        .with_help_message("Recommended to test before actual burning")
+        .prompt()
+    {
+        Ok(s) => s,
+        Err(_) => return,
+    };
+
+    // Create burn options
+    let options = BurnOptions {
+        device: drive.device.clone(),
+        speed,
+        simulate: false,
+        eject: true,
+        force_raw_driver: true,
+    };
+
+    let burner = Cdrdao::new(options);
+
+    // Simulation
+    if simulate_first {
+        println!();
+        println!("{}", "Simulating burn...".bold());
+        println!("This will test the burn process without writing to the disc.");
+        println!();
+
+        match burner.simulate(&toc_file) {
+            Ok(()) => {
+                println!();
+                println!("{} Simulation successful!", "✓".green().bold());
+            }
+            Err(e) => {
+                println!();
+                println!("{} Simulation failed: {}", "✗".red(), e);
+                println!("Please check your disc and try again.");
+                return;
+            }
+        }
+
+        // Confirm actual burn
+        println!();
+        let proceed = match Confirm::new("Proceed with actual burn?")
+            .with_default(true)
+            .prompt()
+        {
+            Ok(p) => p,
+            Err(_) => return,
+        };
+
+        if !proceed {
+            println!("Burn cancelled.");
+            return;
+        }
+    }
+
+    // Insert disc reminder
+    println!();
+    println!("{}", "Ready to Burn".bold().yellow());
+    println!();
+    println!("Make sure you have:");
+    println!("  - A blank CD-R or CD-RW disc inserted");
+    println!("  - Enough space for {} of audio", project.album.format_duration());
+    println!();
+
+    let ready = match Confirm::new("Ready to burn?")
+        .with_default(true)
+        .prompt()
+    {
+        Ok(r) => r,
+        Err(_) => return,
+    };
+
+    if !ready {
+        println!("Burn cancelled.");
+        return;
+    }
+
+    // Actual burn
+    println!();
+    println!("{}", "Burning CD...".bold());
+    println!("This may take several minutes. Do not eject the disc!");
+    println!();
+
+    match burner.burn(&toc_file) {
+        Ok(()) => {
+            println!();
+            println!("{}", "═".repeat(40).green());
+            println!("{}", "  CD burned successfully!".bold().green());
+            println!("{}", "═".repeat(40).green());
+            println!();
+            println!("Your Red Book audio CD is ready.");
+            println!("Album: {}", project.album.title);
+            println!("Tracks: {}", project.album.track_count());
+            println!("Duration: {}", project.album.format_duration());
+        }
+        Err(e) => {
+            println!();
+            println!("{} Burn failed: {}", "✗".red().bold(), e);
+            println!();
+            println!("Possible causes:");
+            println!("  - Disc is not blank or is damaged");
+            println!("  - Drive does not support the requested speed");
+            println!("  - Insufficient buffer or system resources");
+            println!("  - Disc was ejected during burn");
+        }
     }
 }
 

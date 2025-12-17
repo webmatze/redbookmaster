@@ -1,22 +1,55 @@
 // CD burning via cdrdao
 // Provides integration with the cdrdao command-line tool
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::Command;
+
+/// Common paths where cdrdao might be installed
+const CDRDAO_PATHS: &[&str] = &[
+    "cdrdao",                           // In PATH
+    "/opt/homebrew/bin/cdrdao",         // Homebrew on Apple Silicon
+    "/usr/local/bin/cdrdao",            // Homebrew on Intel Mac / manual install
+    "/usr/bin/cdrdao",                  // Linux system install
+    "/bin/cdrdao",                      // Alternative Linux location
+];
+
+/// Find the cdrdao binary path
+pub fn find_cdrdao() -> Option<PathBuf> {
+    for path in CDRDAO_PATHS {
+        let path = PathBuf::from(path);
+
+        // For "cdrdao" (no path), try executing it directly
+        if path.as_os_str() == "cdrdao" {
+            if Command::new("cdrdao")
+                .arg("--version")
+                .output()
+                .map(|o| o.status.success())
+                .unwrap_or(false)
+            {
+                return Some(path);
+            }
+        } else if path.exists() {
+            // For absolute paths, check if file exists
+            return Some(path);
+        }
+    }
+    None
+}
+
+/// Get the cdrdao command (finds the binary automatically)
+fn cdrdao_command() -> Option<Command> {
+    find_cdrdao().map(Command::new)
+}
 
 /// Check if cdrdao is available on the system
 pub fn is_available() -> bool {
-    Command::new("cdrdao")
-        .arg("--version")
-        .output()
-        .map(|o| o.status.success())
-        .unwrap_or(false)
+    find_cdrdao().is_some()
 }
 
 /// Get cdrdao version string
 pub fn version() -> Option<String> {
-    Command::new("cdrdao")
-        .arg("--version")
+    let mut cmd = cdrdao_command()?;
+    cmd.arg("--version")
         .output()
         .ok()
         .and_then(|o| {
@@ -39,7 +72,8 @@ pub struct CdDrive {
 
 /// List available CD drives
 pub fn list_drives() -> Result<Vec<CdDrive>, CdrdaoError> {
-    let output = Command::new("cdrdao")
+    let mut cmd = cdrdao_command().ok_or(CdrdaoError::NotInstalled)?;
+    let output = cmd
         .args(["scanbus"])
         .output()
         .map_err(|e| CdrdaoError::ExecutionError(e.to_string()))?;
@@ -110,10 +144,6 @@ impl Cdrdao {
 
     /// Burn a TOC file to CD
     pub fn burn(&self, toc_file: &Path) -> Result<(), CdrdaoError> {
-        if !is_available() {
-            return Err(CdrdaoError::NotInstalled);
-        }
-
         let mut args = vec!["write"];
 
         // Device
@@ -151,7 +181,8 @@ impl Cdrdao {
         let toc_str = toc_file.to_string_lossy();
         args.push(&toc_str);
 
-        let output = Command::new("cdrdao")
+        let mut cmd = cdrdao_command().ok_or(CdrdaoError::NotInstalled)?;
+        let output = cmd
             .args(&args)
             .output()
             .map_err(|e| CdrdaoError::ExecutionError(e.to_string()))?;
@@ -175,7 +206,8 @@ impl Cdrdao {
 
     /// Read disc info
     pub fn disc_info(&self) -> Result<String, CdrdaoError> {
-        let output = Command::new("cdrdao")
+        let mut cmd = cdrdao_command().ok_or(CdrdaoError::NotInstalled)?;
+        let output = cmd
             .args(["disk-info", "--device", &self.options.device])
             .output()
             .map_err(|e| CdrdaoError::ExecutionError(e.to_string()))?;
@@ -190,7 +222,8 @@ impl Cdrdao {
 
     /// Blank a CD-RW disc
     pub fn blank(&self) -> Result<(), CdrdaoError> {
-        let output = Command::new("cdrdao")
+        let mut cmd = cdrdao_command().ok_or(CdrdaoError::NotInstalled)?;
+        let output = cmd
             .args(["blank", "--device", &self.options.device, "--blank-mode", "minimal"])
             .output()
             .map_err(|e| CdrdaoError::ExecutionError(e.to_string()))?;
@@ -229,5 +262,15 @@ mod tests {
         assert!(options.eject);
         assert!(options.force_raw_driver);
         assert!(!options.simulate);
+    }
+
+    #[test]
+    fn test_find_cdrdao() {
+        // This test verifies cdrdao can be found if installed
+        let found = find_cdrdao();
+        if found.is_some() {
+            println!("Found cdrdao at: {:?}", found.unwrap());
+            assert!(is_available());
+        }
     }
 }
