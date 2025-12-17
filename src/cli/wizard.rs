@@ -644,7 +644,7 @@ fn configure_gaps(project: &mut Project) {
     }
 }
 
-/// Play preview (placeholder)
+/// Play preview - audio playback interface
 fn play_preview(project: &Project) {
     if project.album.tracks.is_empty() {
         println!("No tracks to play.");
@@ -654,16 +654,371 @@ fn play_preview(project: &Project) {
     println!();
     println!("{}", "Play Preview".bold().green());
     println!("{}", "─".repeat(40).dimmed());
+
+    // Build track selection list
+    let mut options: Vec<String> = project
+        .album
+        .tracks
+        .iter()
+        .map(|t| {
+            format!(
+                "{}. {} ({})",
+                t.number,
+                t.title,
+                crate::core::track::format_duration_ms(t.duration)
+            )
+        })
+        .collect();
+
+    options.push("Play all tracks".to_string());
+    options.push("Play transition between tracks".to_string());
+    options.push("Cancel".to_string());
+
+    let selection = match Select::new("What would you like to play?", options).prompt() {
+        Ok(s) => s,
+        Err(_) => return,
+    };
+
+    if selection == "Cancel" {
+        return;
+    }
+
+    if selection == "Play all tracks" {
+        play_all_tracks(project);
+        return;
+    }
+
+    if selection == "Play transition between tracks" {
+        play_transition(project);
+        return;
+    }
+
+    // Play specific track
+    let track_num = selection
+        .split('.')
+        .next()
+        .and_then(|n| n.trim().parse::<usize>().ok());
+
+    if let Some(num) = track_num {
+        if let Some(track) = project.album.tracks.get(num - 1) {
+            play_single_track(track);
+        }
+    }
+}
+
+/// Play a single track with progress display
+fn play_single_track(track: &crate::core::Track) {
+    use indicatif::{ProgressBar, ProgressStyle};
+    use std::io::{self, Read};
+
     println!();
-    println!("{} Audio playback not yet implemented", "⚠".yellow());
-    println!("Tracks in this project:");
+    println!(
+        "Playing: {} {}",
+        format!("Track {}", track.number).cyan(),
+        track.title.bold()
+    );
+    println!("{}", "─".repeat(50).dimmed());
+
+    // Check if file exists
+    if !track.source_file.exists() {
+        println!("{} File not found: {:?}", "✗".red(), track.source_file);
+        return;
+    }
+
+    // Initialize player
+    let mut player = match crate::audio::Player::new() {
+        Ok(p) => p,
+        Err(e) => {
+            println!("{} Failed to initialize audio: {}", "✗".red(), e);
+            return;
+        }
+    };
+
+    // Start playback
+    let duration = match player.play(&track.source_file) {
+        Ok(d) => d,
+        Err(e) => {
+            println!("{} Failed to play: {}", "✗".red(), e);
+            return;
+        }
+    };
+
+    let duration_secs = duration.as_secs();
+    let duration_str = crate::core::track::format_duration_ms(duration);
+
+    // Create progress bar
+    let pb = ProgressBar::new(duration_secs);
+    pb.set_style(
+        ProgressStyle::default_bar()
+            .template("{spinner:.green} [{bar:40.cyan/blue}] {pos}/{len} {msg}")
+            .unwrap()
+            .progress_chars("█▓░"),
+    );
+
+    println!();
+    println!("Controls: [Space] Pause/Resume  [Q] Stop  [+/-] Volume");
+    println!();
+
+    // Set terminal to raw mode for keyboard input
+    #[cfg(unix)]
+    {
+        use std::os::unix::io::AsRawFd;
+        let stdin_fd = io::stdin().as_raw_fd();
+        let mut termios = termios::Termios::from_fd(stdin_fd).ok();
+
+        if let Some(ref mut t) = termios {
+            let original = t.clone();
+            t.c_lflag &= !(termios::ICANON | termios::ECHO);
+            t.c_cc[termios::VMIN] = 0;
+            t.c_cc[termios::VTIME] = 1;
+            let _ = termios::tcsetattr(stdin_fd, termios::TCSANOW, t);
+
+            // Playback loop
+            let start = std::time::Instant::now();
+            let mut paused_time = std::time::Duration::ZERO;
+            let mut pause_start: Option<std::time::Instant> = None;
+
+            loop {
+                // Check if playback finished
+                if player.is_finished() {
+                    pb.finish_with_message("Done!");
+                    break;
+                }
+
+                // Calculate elapsed time (accounting for pauses)
+                let elapsed = if player.is_paused() {
+                    if pause_start.is_none() {
+                        pause_start = Some(std::time::Instant::now());
+                    }
+                    start.elapsed().saturating_sub(paused_time)
+                } else {
+                    if let Some(ps) = pause_start.take() {
+                        paused_time += ps.elapsed();
+                    }
+                    start.elapsed().saturating_sub(paused_time)
+                };
+
+                let elapsed_secs = elapsed.as_secs().min(duration_secs);
+                pb.set_position(elapsed_secs);
+
+                let status = if player.is_paused() { "⏸ PAUSED" } else { "▶ Playing" };
+                let elapsed_str = crate::core::track::format_duration_ms(elapsed);
+                pb.set_message(format!("{} {}/{}", status, elapsed_str, duration_str));
+
+                // Check for keyboard input
+                let mut buf = [0u8; 1];
+                if io::stdin().read(&mut buf).unwrap_or(0) > 0 {
+                    match buf[0] {
+                        b' ' => player.toggle_pause(),
+                        b'q' | b'Q' => {
+                            player.stop();
+                            pb.finish_with_message("Stopped");
+                            break;
+                        }
+                        b'+' | b'=' => {
+                            let vol = (player.volume() + 0.1).min(1.0);
+                            player.set_volume(vol);
+                        }
+                        b'-' | b'_' => {
+                            let vol = (player.volume() - 0.1).max(0.0);
+                            player.set_volume(vol);
+                        }
+                        _ => {}
+                    }
+                }
+
+                std::thread::sleep(std::time::Duration::from_millis(100));
+            }
+
+            // Restore terminal
+            let _ = termios::tcsetattr(stdin_fd, termios::TCSANOW, &original);
+        } else {
+            // Fallback: simple blocking playback
+            simple_playback(&player, duration);
+        }
+    }
+
+    #[cfg(not(unix))]
+    {
+        simple_playback(&player, duration);
+    }
+
+    println!();
+}
+
+/// Simple blocking playback without keyboard controls
+fn simple_playback(player: &crate::audio::Player, duration: std::time::Duration) {
+    use indicatif::{ProgressBar, ProgressStyle};
+
+    let duration_secs = duration.as_secs();
+    let pb = ProgressBar::new(duration_secs);
+    pb.set_style(
+        ProgressStyle::default_bar()
+            .template("{spinner:.green} [{bar:40.cyan/blue}] {pos}/{len}s")
+            .unwrap()
+            .progress_chars("█▓░"),
+    );
+
+    println!("Playing... (Press Ctrl+C to stop)");
+
+    let start = std::time::Instant::now();
+    while !player.is_finished() {
+        let elapsed = start.elapsed().as_secs().min(duration_secs);
+        pb.set_position(elapsed);
+        std::thread::sleep(std::time::Duration::from_millis(100));
+    }
+
+    pb.finish_with_message("Done!");
+}
+
+/// Play all tracks in sequence
+fn play_all_tracks(project: &Project) {
+    println!();
+    println!(
+        "{} {}",
+        "Playing album:".green(),
+        project.album.title.bold()
+    );
+    println!("{}", "─".repeat(50).dimmed());
+    println!("Press Ctrl+C to stop");
+    println!();
+
+    // Initialize player once
+    let mut player = match crate::audio::Player::new() {
+        Ok(p) => p,
+        Err(e) => {
+            println!("{} Failed to initialize audio: {}", "✗".red(), e);
+            return;
+        }
+    };
 
     for track in &project.album.tracks {
         println!(
-            "  {}. {} - {:?}",
-            track.number, track.title, track.source_file
+            "\n{} {} - {}",
+            format!("Track {}:", track.number).cyan(),
+            track.title.bold(),
+            crate::core::track::format_duration_ms(track.duration)
         );
+
+        if !track.source_file.exists() {
+            println!("{} File not found, skipping...", "⚠".yellow());
+            continue;
+        }
+
+        match player.play(&track.source_file) {
+            Ok(_) => {
+                // Wait for track to finish
+                player.wait_until_end();
+            }
+            Err(e) => {
+                println!("{} Failed to play: {}", "✗".red(), e);
+            }
+        }
     }
+
+    println!();
+    println!("{} Playback complete!", "✓".green());
+}
+
+/// Play transition between two tracks
+fn play_transition(project: &Project) {
+    if project.album.tracks.len() < 2 {
+        println!("Need at least 2 tracks to play a transition.");
+        return;
+    }
+
+    println!();
+    println!("{}", "Play Transition".bold().green());
+    println!("This will play the last few seconds of one track");
+    println!("followed by the gap and start of the next track.");
+    println!();
+
+    // Select which transition to play
+    let transition_options: Vec<String> = (1..project.album.tracks.len())
+        .map(|i| {
+            let t1 = &project.album.tracks[i - 1];
+            let t2 = &project.album.tracks[i];
+            format!(
+                "Track {} -> Track {} ({} -> {})",
+                t1.number, t2.number, t1.title, t2.title
+            )
+        })
+        .collect();
+
+    let selection = match Select::new("Select transition to preview:", transition_options).prompt() {
+        Ok(s) => s,
+        Err(_) => return,
+    };
+
+    // Parse selection to get track indices
+    let track_idx = selection
+        .split("->")
+        .next()
+        .and_then(|s| s.trim().strip_prefix("Track "))
+        .and_then(|n| n.trim().parse::<usize>().ok())
+        .map(|n| n - 1);
+
+    let Some(idx) = track_idx else {
+        println!("{} Failed to parse selection", "✗".red());
+        return;
+    };
+
+    let track1 = &project.album.tracks[idx];
+    let track2 = &project.album.tracks[idx + 1];
+
+    println!();
+    println!(
+        "Playing: {} {} -> {} {}",
+        format!("Track {}", track1.number).cyan(),
+        track1.title,
+        format!("Track {}", track2.number).cyan(),
+        track2.title
+    );
+
+    // Initialize player
+    let mut player = match crate::audio::Player::new() {
+        Ok(p) => p,
+        Err(e) => {
+            println!("{} Failed to initialize audio: {}", "✗".red(), e);
+            return;
+        }
+    };
+
+    // Play last 5 seconds of track 1
+    let preview_duration = std::time::Duration::from_secs(5);
+    let skip_to = track1.duration.saturating_sub(preview_duration);
+
+    println!("  Playing end of track {}...", track1.number);
+
+    if track1.source_file.exists() {
+        if let Ok(_) = player.play_from(&track1.source_file, skip_to) {
+            player.wait_until_end();
+        }
+    }
+
+    // Play gap (silence)
+    if track2.pregap.as_millis() > 0 {
+        println!(
+            "  [Gap: {} seconds]",
+            track2.pregap.as_secs_f32()
+        );
+        std::thread::sleep(track2.pregap.min(std::time::Duration::from_secs(3)));
+    }
+
+    // Play first 5 seconds of track 2
+    println!("  Playing start of track {}...", track2.number);
+
+    if track2.source_file.exists() {
+        if let Ok(duration) = player.play(&track2.source_file) {
+            // Only play first 5 seconds
+            let play_time = duration.min(preview_duration);
+            std::thread::sleep(play_time);
+            player.stop();
+        }
+    }
+
+    println!();
+    println!("{} Transition preview complete!", "✓".green());
 }
 
 /// Export master (placeholder)

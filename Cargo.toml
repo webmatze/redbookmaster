@@ -23,6 +23,9 @@ chrono = { version = "0.4", features = ["serde"] }
 indicatif = "0.17"
 regex = "1"
 
+[target.'cfg(unix)'.dependencies]
+termios = "0.3"
+
 [profile.release]
 lto = true
 codegen-units = 1
