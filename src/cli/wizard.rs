@@ -118,6 +118,79 @@ pub fn new_project() {
     project_menu(project);
 }
 
+/// Convert a non-compliant WAV file and add it as a track
+fn convert_and_add_track(
+    project: &mut Project,
+    source_path: &std::path::Path,
+    title: &str,
+    info: &crate::audio::WavInfo,
+) -> Result<(), String> {
+    use indicatif::{ProgressBar, ProgressStyle};
+
+    println!();
+    println!("{} Converting to Red Book format...", "⟳".cyan());
+    println!(
+        "  Input: {}Hz, {}-bit, {} channel(s)",
+        info.sample_rate, info.bits_per_sample, info.channels
+    );
+    println!("  Target: 44100Hz, 16-bit, stereo");
+
+    // Create output filename in same directory as source
+    let output_path = source_path.with_file_name(format!(
+        "{}_converted.wav",
+        source_path
+            .file_stem()
+            .and_then(|s| s.to_str())
+            .unwrap_or("track")
+    ));
+
+    // Show progress spinner
+    let pb = ProgressBar::new_spinner();
+    pb.set_style(
+        ProgressStyle::default_spinner()
+            .template("{spinner:.green} {msg}")
+            .unwrap(),
+    );
+    pb.set_message("Converting audio...");
+    pb.enable_steady_tick(std::time::Duration::from_millis(100));
+
+    // Perform conversion
+    let result = crate::audio::convert_to_red_book(source_path, &output_path);
+
+    pb.finish_and_clear();
+
+    match result {
+        Ok(conversion) => {
+            println!("{} Conversion complete: {}", "✓".green(), conversion.summary());
+
+            // Read the converted file info
+            match crate::audio::wav::read_wav_info(&output_path) {
+                Ok(new_info) => {
+                    let track = crate::core::Track::new(
+                        (project.album.track_count() + 1) as u8,
+                        title.to_string(),
+                        output_path.clone(),
+                        new_info.duration,
+                    );
+
+                    project.album.add_track(track);
+                    println!(
+                        "{} Added: {} ({})",
+                        "✓".green(),
+                        title,
+                        crate::core::track::format_duration_ms(new_info.duration)
+                    );
+                    println!("  Converted file: {:?}", output_path);
+
+                    Ok(())
+                }
+                Err(e) => Err(format!("Failed to read converted file: {}", e)),
+            }
+        }
+        Err(e) => Err(format!("{}", e)),
+    }
+}
+
 /// Add tracks wizard
 pub fn add_tracks_wizard(project: &mut Project) {
     println!();
@@ -187,23 +260,28 @@ pub fn add_tracks_wizard(project: &mut Project) {
 
                     match action {
                         Ok("Convert automatically") => {
-                            println!("{} Auto-conversion not yet implemented", "⚠".yellow());
-                            // TODO: Implement conversion
-                            continue;
+                            match convert_and_add_track(project, &path, &title, &info) {
+                                Ok(()) => continue,
+                                Err(e) => {
+                                    println!("{} Conversion failed: {}", "✗".red(), e);
+                                    continue;
+                                }
+                            }
                         }
                         Ok("Skip this file") => continue,
                         Ok("Abort") | Err(_) => break,
                         _ => continue,
                     }
+                } else {
+                    // File is already compliant
+                    project.album.add_track(track);
+                    println!(
+                        "{} Added: {} ({})",
+                        "✓".green(),
+                        title,
+                        crate::core::track::format_duration_ms(info.duration)
+                    );
                 }
-
-                project.album.add_track(track);
-                println!(
-                    "{} Added: {} ({})",
-                    "✓".green(),
-                    title,
-                    crate::core::track::format_duration_ms(info.duration)
-                );
             }
             Err(e) => {
                 println!("{} Failed to read WAV file: {}", "✗".red(), e);
