@@ -177,6 +177,7 @@ export component MainWindow inherits Window {
     callback waveform-seek(float);
     callback zoom-in();
     callback zoom-out();
+    callback reorder-tracks(int, int);  // from-index, to-index
 
     // Properties bound to Rust
     in property <[TrackData]> tracks: [];
@@ -196,6 +197,11 @@ export component MainWindow inherits Window {
     // Internal state
     property <int> hover-track: -1;
     property <float> zoom-level: 1.0;
+
+    // Drag-and-drop state for track reordering
+    property <int> dragging-track-index: -1;
+    property <int> drop-target-index: -1;
+    property <bool> is-dragging: false;
 
     // Helper to format position as M:SS
     pure function format-time(seconds: float) -> string {
@@ -526,20 +532,71 @@ export component MainWindow inherits Window {
                         VerticalLayout {
                             spacing: 2px;
                             alignment: start;
+                            padding-top: 4px;  // Space for drop indicator above first track
 
                             for track[idx] in root.tracks: Rectangle {
                                 height: 36px;
                                 border-radius: 4px;
                                 background: idx == root.selected-track-index ? Theme.track-selected :
                                            (idx == root.hover-track ? Theme.button-hover : transparent);
+                                // Dim the track being dragged
+                                opacity: root.is-dragging && idx == root.dragging-track-index ? 0.5 : 1.0;
+
+                                // Drop indicator line ABOVE this track (insert before)
+                                if root.is-dragging && idx == root.drop-target-index && idx != root.dragging-track-index && root.drop-target-index < root.tracks.length: Rectangle {
+                                    x: 0;
+                                    y: -3px;
+                                    width: parent.width;
+                                    height: 3px;
+                                    background: Theme.accent;
+                                    border-radius: 1px;
+                                }
+
+                                // Drop indicator line BELOW this track (insert after - only on last track)
+                                if root.is-dragging && idx == root.tracks.length - 1 && root.drop-target-index == root.tracks.length && idx != root.dragging-track-index: Rectangle {
+                                    x: 0;
+                                    y: parent.height;
+                                    width: parent.width;
+                                    height: 3px;
+                                    background: Theme.accent;
+                                    border-radius: 1px;
+                                }
 
                                 track-touch := TouchArea {
-                                    clicked => {
-                                        root.select-track(track.number);
-                                    }
+                                    // Track height for calculating drop position
+                                    property <length> track-height: 36px;
+
                                     pointer-event(e) => {
-                                        if e.kind == PointerEventKind.move {
+                                        if e.kind == PointerEventKind.down {
+                                            // Start drag
+                                            root.dragging-track-index = idx;
+                                            root.drop-target-index = idx;
+                                            root.is-dragging = true;
+                                        } else if e.kind == PointerEventKind.up {
+                                            // End drag - reorder if dropped on different position
+                                            if root.is-dragging && root.drop-target-index != root.dragging-track-index && root.drop-target-index >= 0 {
+                                                root.reorder-tracks(root.dragging-track-index, root.drop-target-index);
+                                            } else if !root.is-dragging || root.drop-target-index == root.dragging-track-index {
+                                                // Simple click - select track
+                                                root.select-track(track.number);
+                                            }
+                                            root.is-dragging = false;
+                                            root.dragging-track-index = -1;
+                                            root.drop-target-index = -1;
+                                        } else if e.kind == PointerEventKind.move {
                                             root.hover-track = idx;
+                                        }
+                                    }
+
+                                    // Use moved callback to track mouse position during drag
+                                    moved => {
+                                        if root.is-dragging {
+                                            // Calculate target index based on mouse Y offset from starting track
+                                            // self.mouse-y is relative to this TouchArea (the track where drag started)
+                                            // Each track is 36px + 2px spacing = 38px
+                                            // Use round() so indicator switches when crossing track middle
+                                            // Allow up to tracks.length to indicate "insert at end"
+                                            root.drop-target-index = max(0, min(root.tracks.length, idx + round(self.mouse-y / 38px)));
                                         }
                                     }
                                 }
@@ -548,8 +605,17 @@ export component MainWindow inherits Window {
                                     padding-left: 8px;
                                     padding-right: 8px;
 
+                                    // Drag handle indicator
                                     Text {
-                                        width: 30px;
+                                        width: 16px;
+                                        text: "≡";
+                                        color: Theme.text-dimmed;
+                                        font-size: 12px;
+                                        vertical-alignment: center;
+                                    }
+
+                                    Text {
+                                        width: 24px;
                                         text: track.number;
                                         color: Theme.text-secondary;
                                         font-size: 12px;

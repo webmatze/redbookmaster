@@ -918,6 +918,92 @@ fn main() -> Result<(), slint::PlatformError> {
         }
     });
 
+    // Track reordering via drag-and-drop
+    let state_clone = state.clone();
+    let app_weak = app.as_weak();
+    app.on_reorder_tracks(move |from_index, to_index| {
+        let from_idx = from_index as usize;
+        let to_idx = to_index as usize;
+
+        // First pass: reorder tracks and get metadata
+        let (tracks, new_selected_idx, track_metadata) = {
+            let mut state = state_clone.borrow_mut();
+            let Some(ref mut project) = state.project else {
+                return;
+            };
+
+            let track_count = project.album.tracks.len();
+            // to_idx can be track_count (meaning "insert at end")
+            if from_idx >= track_count || to_idx > track_count || from_idx == to_idx {
+                return;
+            }
+
+            // Remove track from old position
+            let track = project.album.tracks.remove(from_idx);
+
+            // Calculate insert position:
+            // - When dragging DOWN (from < to), the target index shifted down by 1 after removal
+            // - When dragging UP (from > to), no adjustment needed
+            let insert_idx = if from_idx < to_idx {
+                to_idx - 1
+            } else {
+                to_idx
+            };
+
+            project.album.tracks.insert(insert_idx, track);
+
+            // Renumber all tracks
+            for (i, track) in project.album.tracks.iter_mut().enumerate() {
+                track.number = (i + 1) as u8;
+            }
+
+            // Get metadata for the moved track (now at insert_idx)
+            let track_metadata = project.album.tracks.get(insert_idx).map(|t| {
+                (t.title.clone(), t.pregap.as_secs(), t.number)
+            });
+
+            // Prepare UI data
+            let tracks = state.tracks_to_model();
+
+            // Invalidate waveform cache since track numbers changed
+            state.current_waveform = None;
+
+            (tracks, insert_idx as i32, track_metadata)
+        };
+
+        // Second pass: extract waveform (needs separate borrow)
+        let waveform_data = if let Some((_, _, track_num)) = track_metadata {
+            let mut state = state_clone.borrow_mut();
+            state.extract_waveform(track_num).map(|cache| {
+                (cache.peaks.clone(), cache.duration_str.clone())
+            })
+        } else {
+            None
+        };
+
+        // Update UI
+        if let Some(app) = app_weak.upgrade() {
+            let model = Rc::new(slint::VecModel::from(tracks));
+            app.set_tracks(model.into());
+            app.set_selected_track_index(new_selected_idx);
+
+            // Update metadata editor
+            if let Some((title, pregap, _)) = track_metadata {
+                app.set_current_track_title(title.into());
+                app.set_current_track_pregap(pregap.to_string().into());
+            }
+
+            // Update waveform
+            if let Some((peaks, duration)) = waveform_data {
+                app.set_waveform_peaks(Rc::new(slint::VecModel::from(peaks)).into());
+                app.set_waveform_duration(duration.into());
+            }
+
+            app.set_playhead_position(0.0);
+            app.set_status_message("Track reordered".into());
+        }
+    });
+
     // Set up a timer to poll for position updates from the audio engine
     let app_weak = app.as_weak();
     let engine_for_timer = audio_engine.clone();
