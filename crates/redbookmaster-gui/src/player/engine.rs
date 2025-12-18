@@ -41,8 +41,10 @@ pub enum PlayerEvent {
     Playing,
     /// Playback paused
     Paused,
-    /// Playback stopped
+    /// Playback stopped by user
     Stopped,
+    /// Track finished playing naturally (reached end)
+    TrackFinished,
     /// Position update (milliseconds from start)
     Position(u64),
     /// Error occurred
@@ -377,7 +379,7 @@ fn audio_thread(
                 let duration = state.duration_ms.load(Ordering::Relaxed);
 
                 if current_pos >= duration {
-                    // Playback finished - recreate sink
+                    // Playback finished naturally - recreate sink
                     drop(sink.take());
                     sink = create_sink(&stream_handle, *state.volume.lock());
 
@@ -386,7 +388,7 @@ fn audio_thread(
                     state.position_ms.store(0, Ordering::Relaxed);
                     state.is_playing.store(false, Ordering::Relaxed);
                     state.is_paused.store(false, Ordering::Relaxed);
-                    let _ = event_tx.try_send(PlayerEvent::Stopped);
+                    let _ = event_tx.try_send(PlayerEvent::TrackFinished);
                 } else {
                     state.position_ms.store(current_pos, Ordering::Relaxed);
                     let _ = event_tx.try_send(PlayerEvent::Position(current_pos));

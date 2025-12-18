@@ -519,6 +519,7 @@ fn main() -> Result<(), slint::PlatformError> {
     // Set up a timer to poll for position updates from the audio engine
     let app_weak = app.as_weak();
     let engine_for_timer = audio_engine.clone();
+    let state_for_timer = state.clone();
     let timer = slint::Timer::default();
     timer.start(
         slint::TimerMode::Repeated,
@@ -551,12 +552,66 @@ fn main() -> Result<(), slint::PlatformError> {
                         app.set_playback(playback);
                     }
                     PlayerEvent::Stopped => {
+                        // User-initiated stop
                         let mut playback = app.get_playback();
                         playback.is_playing = false;
                         playback.is_paused = false;
                         playback.position = 0.0;
                         app.set_playback(playback);
                         app.set_playhead_position(0.0);
+                    }
+                    PlayerEvent::TrackFinished => {
+                        // Track finished naturally - try to play next track
+                        let tracks = app.get_tracks();
+                        let current_index = app.get_selected_track_index();
+                        let next_index = current_index + 1;
+
+                        if next_index < tracks.row_count() as i32 {
+                            // There's a next track - select and play it
+                            if let Some(next_track) = tracks.row_data(next_index as usize) {
+                                let track_num = next_track.number as u8;
+
+                                // Load the next track
+                                let mut state = state_for_timer.borrow_mut();
+                                if let Some(track) = state.get_track(track_num) {
+                                    let path = track.source_file.clone();
+                                    state.current_track_path = Some(path.clone());
+                                    state.current_track_num = Some(track_num);
+                                    engine_for_timer.load(path);
+                                }
+
+                                // Extract waveform
+                                if let Some(cache) = state.extract_waveform(track_num) {
+                                    let peaks = cache.peaks.clone();
+                                    let duration = cache.duration_str.clone();
+
+                                    let model = Rc::new(slint::VecModel::from(peaks));
+                                    app.set_waveform_peaks(model.into());
+                                    app.set_waveform_duration(duration.into());
+                                }
+
+                                app.set_selected_track_index(next_index);
+                                app.set_playhead_position(0.0);
+                                drop(state);
+
+                                // Start playing the next track
+                                engine_for_timer.play();
+                                let mut playback = app.get_playback();
+                                playback.is_playing = true;
+                                playback.is_paused = false;
+                                app.set_playback(playback);
+                                app.set_status_message(format!("Playing track {}", track_num).into());
+                            }
+                        } else {
+                            // This was the last track - stop playback
+                            let mut playback = app.get_playback();
+                            playback.is_playing = false;
+                            playback.is_paused = false;
+                            playback.position = 0.0;
+                            app.set_playback(playback);
+                            app.set_playhead_position(0.0);
+                            app.set_status_message("Playback finished".into());
+                        }
                     }
                     PlayerEvent::Position(pos_ms) => {
                         let playback = app.get_playback();
