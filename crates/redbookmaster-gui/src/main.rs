@@ -1,13 +1,18 @@
 // Red Book Master GUI
 // Professional CD mastering application with Slint UI
 
+mod player;
+
 use std::rc::Rc;
 use std::cell::RefCell;
 use std::path::PathBuf;
+use std::sync::Arc;
 
 use redbookmaster_lib::{Album, Project, Track, extract_peaks};
 use redbookmaster_lib::core::track::format_duration_ms;
 use slint::Model;
+
+use player::{AudioEngine, PlayerEvent};
 
 slint::include_modules!();
 
@@ -19,6 +24,8 @@ struct AppState {
     project: Option<Project>,
     project_path: Option<PathBuf>,
     current_waveform: Option<WaveformCache>,
+    current_track_path: Option<PathBuf>,
+    current_track_num: Option<u8>,
 }
 
 /// Cached waveform data
@@ -34,6 +41,8 @@ impl AppState {
             project: None,
             project_path: None,
             current_waveform: None,
+            current_track_path: None,
+            current_track_num: None,
         }
     }
 
@@ -43,6 +52,8 @@ impl AppState {
         self.project = Some(project);
         self.project_path = None;
         self.current_waveform = None;
+        self.current_track_path = None;
+        self.current_track_num = None;
     }
 
     fn tracks_to_model(&self) -> Vec<TrackData> {
@@ -120,6 +131,15 @@ impl AppState {
 fn main() -> Result<(), slint::PlatformError> {
     let app = MainWindow::new()?;
     let state = Rc::new(RefCell::new(AppState::new()));
+
+    // Initialize audio engine
+    let audio_engine = match AudioEngine::new() {
+        Ok(engine) => Arc::new(engine),
+        Err(e) => {
+            eprintln!("Failed to initialize audio: {}", e);
+            return Err(slint::PlatformError::Other(e));
+        }
+    };
 
     // Initialize with empty state
     app.set_status_message("Welcome to Red Book Master".into());
@@ -266,6 +286,7 @@ fn main() -> Result<(), slint::PlatformError> {
     // Track selection with waveform extraction
     let app_weak = app.as_weak();
     let state_clone = state.clone();
+    let engine_clone = audio_engine.clone();
     app.on_select_track(move |track_num| {
         let mut state = state_clone.borrow_mut();
 
@@ -286,6 +307,16 @@ fn main() -> Result<(), slint::PlatformError> {
             app.set_status_message(format!("Loading waveform for track {}...", track_num).into());
         }
 
+        // Get track path for audio playback
+        if let Some(track) = state.get_track(track_num as u8) {
+            let path = track.source_file.clone();
+            state.current_track_path = Some(path.clone());
+            state.current_track_num = Some(track_num as u8);
+
+            // Load track into audio engine
+            engine_clone.load(path);
+        }
+
         // Extract waveform
         if let Some(cache) = state.extract_waveform(track_num as u8) {
             if let Some(app) = app_weak.upgrade() {
@@ -297,6 +328,9 @@ fn main() -> Result<(), slint::PlatformError> {
                 app.set_waveform_duration(duration.into());
                 app.set_waveform_loading(false);
                 app.set_status_message(format!("Track {} selected", track_num).into());
+
+                // Reset playhead position
+                app.set_playhead_position(0.0);
             }
         } else {
             if let Some(app) = app_weak.upgrade() {
@@ -346,30 +380,64 @@ fn main() -> Result<(), slint::PlatformError> {
         }
     });
 
-    // Placeholder callbacks for playback (to be implemented in Phase 6)
-    app.on_play(|| {
-        println!("Play clicked");
+    // Playback callbacks
+    let engine_clone = audio_engine.clone();
+    let app_weak = app.as_weak();
+    app.on_play(move || {
+        engine_clone.play();
+        if let Some(app) = app_weak.upgrade() {
+            let mut playback = app.get_playback();
+            playback.is_playing = true;
+            playback.is_paused = false;
+            app.set_playback(playback);
+            app.set_status_message("Playing".into());
+        }
     });
 
-    app.on_pause(|| {
-        println!("Pause clicked");
+    let engine_clone = audio_engine.clone();
+    let app_weak = app.as_weak();
+    app.on_pause(move || {
+        engine_clone.pause();
+        if let Some(app) = app_weak.upgrade() {
+            let mut playback = app.get_playback();
+            playback.is_paused = true;
+            app.set_playback(playback);
+            app.set_status_message("Paused".into());
+        }
     });
 
-    app.on_stop(|| {
-        println!("Stop clicked");
+    let engine_clone = audio_engine.clone();
+    let app_weak = app.as_weak();
+    app.on_stop(move || {
+        engine_clone.stop();
+        if let Some(app) = app_weak.upgrade() {
+            let mut playback = app.get_playback();
+            playback.is_playing = false;
+            playback.is_paused = false;
+            playback.position = 0.0;
+            app.set_playback(playback);
+            app.set_playhead_position(0.0);
+            app.set_status_message("Stopped".into());
+        }
     });
 
-    app.on_seek(|_pos| {
-        println!("Seek clicked");
+    let engine_clone = audio_engine.clone();
+    app.on_seek(move |pos| {
+        engine_clone.seek(pos);
     });
 
-    app.on_set_volume(|vol| {
-        println!("Volume: {}", vol);
+    let engine_clone = audio_engine.clone();
+    app.on_set_volume(move |vol| {
+        engine_clone.set_volume(vol);
     });
 
-    app.on_waveform_seek(|pos| {
-        println!("Waveform seek to: {:.2}", pos);
-        // TODO: Implement seek in playback
+    let engine_clone = audio_engine.clone();
+    let app_weak = app.as_weak();
+    app.on_waveform_seek(move |pos| {
+        engine_clone.seek(pos);
+        if let Some(app) = app_weak.upgrade() {
+            app.set_playhead_position(pos);
+        }
     });
 
     app.on_zoom_in(|| {
@@ -404,6 +472,72 @@ fn main() -> Result<(), slint::PlatformError> {
         println!("Update pregap for track {}: {}", track_num, pregap);
         // TODO: Implement pregap update
     });
+
+    // Set up a timer to poll for position updates from the audio engine
+    let app_weak = app.as_weak();
+    let engine_for_timer = audio_engine.clone();
+    let timer = slint::Timer::default();
+    timer.start(
+        slint::TimerMode::Repeated,
+        std::time::Duration::from_millis(50),
+        move || {
+            // Process events from audio engine
+            while let Some(event) = engine_for_timer.try_recv_event() {
+                let Some(app) = app_weak.upgrade() else { return };
+
+                match event {
+                    PlayerEvent::Loaded { duration_ms } => {
+                        // Reset to stopped state when a new track is loaded
+                        let mut playback = app.get_playback();
+                        playback.duration = duration_ms as f32 / 1000.0;
+                        playback.position = 0.0;
+                        playback.is_playing = false;
+                        playback.is_paused = false;
+                        app.set_playback(playback);
+                        app.set_playhead_position(0.0);
+                    }
+                    PlayerEvent::Playing => {
+                        let mut playback = app.get_playback();
+                        playback.is_playing = true;
+                        playback.is_paused = false;
+                        app.set_playback(playback);
+                    }
+                    PlayerEvent::Paused => {
+                        let mut playback = app.get_playback();
+                        playback.is_paused = true;
+                        app.set_playback(playback);
+                    }
+                    PlayerEvent::Stopped => {
+                        let mut playback = app.get_playback();
+                        playback.is_playing = false;
+                        playback.is_paused = false;
+                        playback.position = 0.0;
+                        app.set_playback(playback);
+                        app.set_playhead_position(0.0);
+                    }
+                    PlayerEvent::Position(pos_ms) => {
+                        let playback = app.get_playback();
+                        let duration_ms = (playback.duration * 1000.0) as u64;
+                        if duration_ms > 0 {
+                            let position_ratio = pos_ms as f32 / duration_ms as f32;
+                            app.set_playhead_position(position_ratio);
+
+                            // Update playback position
+                            let mut playback = playback;
+                            playback.position = pos_ms as f32 / 1000.0;
+                            app.set_playback(playback);
+                        }
+                    }
+                    PlayerEvent::Error(msg) => {
+                        app.set_status_message(format!("Error: {}", msg).into());
+                    }
+                }
+            }
+        },
+    );
+
+    // Keep timer alive by moving it into a variable that lives until app.run() completes
+    let _timer = timer;
 
     app.run()
 }

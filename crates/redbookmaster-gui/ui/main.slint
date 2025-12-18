@@ -181,16 +181,22 @@ export component MainWindow inherits Window {
     // Properties bound to Rust
     in property <[TrackData]> tracks: [];
     in property <AlbumData> album: { title: "Untitled Album", performer: "", songwriter: "", catalog: "" };
-    in property <PlaybackState> playback: { is-playing: false, is-paused: false, current-track: -1, position: 0, duration: 0, volume: 0.8 };
+    in-out property <PlaybackState> playback: { is-playing: false, is-paused: false, current-track: -1, position: 0, duration: 0, volume: 0.8 };
     in property <int> selected-track-index: -1;
     in property <string> status-message: "Ready";
     in property <[WaveformPeak]> waveform-peaks: [];
     in property <string> waveform-duration: "0:00";
     in property <bool> waveform-loading: false;
+    in-out property <float> playhead-position: 0.0;
 
     // Internal state
     property <int> hover-track: -1;
     property <float> zoom-level: 1.0;
+
+    // Helper to format position as M:SS
+    pure function format-time(seconds: float) -> string {
+        floor(seconds / 60) + ":" + (mod(floor(seconds), 60) < 10 ? "0" : "") + floor(mod(seconds, 60))
+    }
 
     VerticalLayout {
         // Menu bar
@@ -616,7 +622,7 @@ export component MainWindow inherits Window {
                         if !root.waveform-loading && root.selected-track-index >= 0: WaveformView {
                             vertical-stretch: 1;
                             peaks: root.waveform-peaks;
-                            playhead-position: root.playback.duration > 0 ? root.playback.position / root.playback.duration : 0.0;
+                            playhead-position <=> root.playhead-position;
                             is-playing: root.playback.is-playing;
                             zoom: root.zoom-level;
 
@@ -693,7 +699,7 @@ export component MainWindow inherits Window {
                             alignment: center;
 
                             Text {
-                                text: "0:00 / " + root.waveform-duration;
+                                text: root.format-time(root.playback.position) + " / " + root.waveform-duration;
                                 color: Theme.text-primary;
                                 font-size: 14px;
                                 font-family: "monospace";
