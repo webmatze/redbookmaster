@@ -1,0 +1,307 @@
+// Red Book Master GUI
+// Professional CD mastering application with Slint UI
+
+use std::rc::Rc;
+use std::cell::RefCell;
+use std::path::PathBuf;
+
+use redbookmaster_lib::{Album, Project, Track};
+use redbookmaster_lib::core::track::format_duration_ms;
+use slint::Model;
+
+slint::include_modules!();
+
+/// Application state
+struct AppState {
+    project: Option<Project>,
+    project_path: Option<PathBuf>,
+}
+
+impl AppState {
+    fn new() -> Self {
+        Self {
+            project: None,
+            project_path: None,
+        }
+    }
+
+    fn new_project(&mut self) {
+        let album = Album::new("Untitled Album".to_string(), "".to_string());
+        let project = Project::new(album);
+        self.project = Some(project);
+        self.project_path = None;
+    }
+
+    fn tracks_to_model(&self) -> Vec<TrackData> {
+        let Some(project) = &self.project else {
+            return Vec::new();
+        };
+
+        project.album.tracks.iter().map(|track| {
+            TrackData {
+                number: track.number as i32,
+                title: track.title.clone().into(),
+                duration: format_duration_ms(track.duration).into(),
+                pregap: track.pregap.as_secs().to_string().into(),
+                postgap: track.postgap.as_secs().to_string().into(),
+                selected: false,
+            }
+        }).collect()
+    }
+
+    fn album_to_model(&self) -> AlbumData {
+        let Some(project) = &self.project else {
+            return AlbumData::default();
+        };
+
+        AlbumData {
+            title: project.album.title.clone().into(),
+            performer: project.album.performer.clone().into(),
+            songwriter: project.album.songwriter.clone().unwrap_or_default().into(),
+            catalog: project.album.catalog.as_ref().map(|c| c.to_string()).unwrap_or_default().into(),
+        }
+    }
+}
+
+fn main() -> Result<(), slint::PlatformError> {
+    let app = MainWindow::new()?;
+    let state = Rc::new(RefCell::new(AppState::new()));
+
+    // Initialize with empty state
+    app.set_status_message("Welcome to Red Book Master".into());
+
+    // Wire up callbacks
+    let app_weak = app.as_weak();
+    let state_clone = state.clone();
+    app.on_new_project(move || {
+        let mut state = state_clone.borrow_mut();
+        state.new_project();
+
+        if let Some(app) = app_weak.upgrade() {
+            let tracks: Vec<TrackData> = state.tracks_to_model();
+            let model = Rc::new(slint::VecModel::from(tracks));
+            app.set_tracks(model.into());
+            app.set_album(state.album_to_model());
+            app.set_status_message("New project created".into());
+            app.set_selected_track_index(-1);
+        }
+    });
+
+    let app_weak = app.as_weak();
+    let state_clone = state.clone();
+    app.on_open_project(move || {
+        let dialog = rfd::FileDialog::new()
+            .add_filter("Red Book Master Project", &["rbm"])
+            .set_title("Open Project");
+
+        if let Some(path) = dialog.pick_file() {
+            match Project::load(&path) {
+                Ok(project) => {
+                    let mut state = state_clone.borrow_mut();
+                    state.project = Some(project);
+                    state.project_path = Some(path.clone());
+
+                    if let Some(app) = app_weak.upgrade() {
+                        let tracks: Vec<TrackData> = state.tracks_to_model();
+                        let model = Rc::new(slint::VecModel::from(tracks));
+                        app.set_tracks(model.into());
+                        app.set_album(state.album_to_model());
+                        app.set_status_message(format!("Opened: {}", path.display()).into());
+                        app.set_selected_track_index(-1);
+                    }
+                }
+                Err(e) => {
+                    eprintln!("Failed to open project: {}", e);
+                    if let Some(app) = app_weak.upgrade() {
+                        app.set_status_message(format!("Error: {}", e).into());
+                    }
+                }
+            }
+        }
+    });
+
+    let app_weak = app.as_weak();
+    let state_clone = state.clone();
+    app.on_save_project(move || {
+        let state = state_clone.borrow();
+        if let Some(ref project) = state.project {
+            if let Some(ref path) = state.project_path {
+                match project.save_to(path) {
+                    Ok(()) => {
+                        if let Some(app) = app_weak.upgrade() {
+                            app.set_status_message("Project saved".into());
+                        }
+                    }
+                    Err(e) => {
+                        if let Some(app) = app_weak.upgrade() {
+                            app.set_status_message(format!("Save failed: {}", e).into());
+                        }
+                    }
+                }
+            } else {
+                // No path set, trigger Save As
+                drop(state);
+                // TODO: Implement save as dialog
+            }
+        }
+    });
+
+    let app_weak = app.as_weak();
+    let state_clone = state.clone();
+    app.on_add_tracks(move || {
+        let dialog = rfd::FileDialog::new()
+            .add_filter("WAV Audio", &["wav", "WAV"])
+            .set_title("Select WAV files to add");
+
+        if let Some(files) = dialog.pick_files() {
+            let mut state = state_clone.borrow_mut();
+
+            // Create a new project if none exists
+            if state.project.is_none() {
+                state.new_project();
+            }
+
+            let project = state.project.as_mut().unwrap();
+            let mut added = 0;
+
+            for path in files {
+                match redbookmaster_lib::read_wav_info(&path) {
+                    Ok(info) => {
+                        if info.is_red_book_compliant() {
+                            let title = path.file_stem()
+                                .and_then(|s| s.to_str())
+                                .unwrap_or("Unknown")
+                                .to_string();
+
+                            let track = Track::new(
+                                (project.album.track_count() + 1) as u8,
+                                title,
+                                path,
+                                info.duration,
+                            );
+                            project.album.add_track(track);
+                            added += 1;
+                        } else {
+                            eprintln!("File not Red Book compliant: {:?}", path);
+                            // TODO: Show conversion dialog
+                        }
+                    }
+                    Err(e) => {
+                        eprintln!("Failed to read WAV: {}", e);
+                    }
+                }
+            }
+
+            if let Some(app) = app_weak.upgrade() {
+                let tracks: Vec<TrackData> = state.tracks_to_model();
+                let model = Rc::new(slint::VecModel::from(tracks));
+                app.set_tracks(model.into());
+                app.set_album(state.album_to_model());
+                app.set_status_message(format!("Added {} track(s)", added).into());
+            }
+        }
+    });
+
+    let app_weak = app.as_weak();
+    app.on_select_track(move |track_num| {
+        if let Some(app) = app_weak.upgrade() {
+            let tracks = app.get_tracks();
+            for i in 0..tracks.row_count() {
+                if let Some(track) = tracks.row_data(i) {
+                    if track.number == track_num {
+                        app.set_selected_track_index(i as i32);
+                        break;
+                    }
+                }
+            }
+        }
+    });
+
+    let state_clone = state.clone();
+    let app_weak = app.as_weak();
+    app.on_update_album_title(move |title| {
+        let mut state = state_clone.borrow_mut();
+        if let Some(ref mut project) = state.project {
+            project.album.title = title.to_string();
+            if let Some(app) = app_weak.upgrade() {
+                app.set_album(state.album_to_model());
+            }
+        }
+    });
+
+    let state_clone = state.clone();
+    let app_weak = app.as_weak();
+    app.on_update_album_performer(move |performer| {
+        let mut state = state_clone.borrow_mut();
+        if let Some(ref mut project) = state.project {
+            project.album.performer = performer.to_string();
+            if let Some(app) = app_weak.upgrade() {
+                app.set_album(state.album_to_model());
+            }
+        }
+    });
+
+    let state_clone = state.clone();
+    let app_weak = app.as_weak();
+    app.on_update_track_title(move |track_num, title| {
+        let mut state = state_clone.borrow_mut();
+        if let Some(ref mut project) = state.project {
+            if let Some(track) = project.album.get_track_mut(track_num as u8) {
+                track.title = title.to_string();
+                if let Some(app) = app_weak.upgrade() {
+                    let tracks: Vec<TrackData> = state.tracks_to_model();
+                    let model = Rc::new(slint::VecModel::from(tracks));
+                    app.set_tracks(model.into());
+                }
+            }
+        }
+    });
+
+    // Placeholder callbacks for playback (to be implemented in Phase 6)
+    app.on_play(|| {
+        println!("Play clicked");
+    });
+
+    app.on_pause(|| {
+        println!("Pause clicked");
+    });
+
+    app.on_stop(|| {
+        println!("Stop clicked");
+    });
+
+    app.on_seek(|_pos| {
+        println!("Seek clicked");
+    });
+
+    app.on_set_volume(|vol| {
+        println!("Volume: {}", vol);
+    });
+
+    app.on_export_master(|| {
+        println!("Export clicked");
+        // TODO: Implement export dialog
+    });
+
+    app.on_burn_cd(|| {
+        println!("Burn CD clicked");
+        // TODO: Implement burn dialog
+    });
+
+    app.on_save_project_as(|| {
+        println!("Save As clicked");
+        // TODO: Implement save as dialog
+    });
+
+    app.on_remove_track(|_track_num| {
+        println!("Remove track clicked");
+        // TODO: Implement track removal
+    });
+
+    app.on_update_track_pregap(|track_num, pregap| {
+        println!("Update pregap for track {}: {}", track_num, pregap);
+        // TODO: Implement pregap update
+    });
+
+    app.run()
+}

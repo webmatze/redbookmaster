@@ -1,0 +1,23 @@
+[package]
+name = "redbookmaster-gui"
+version = "0.1.0"
+edition = "2021"
+description = "GUI application for creating Red Book compatible CD masters"
+authors = ["Mathias Karstaedt"]
+license = "MIT"
+repository = "https://github.com/webmatze/redbookmaster"
+
+[[bin]]
+name = "redbookmaster-gui"
+path = "src/main.rs"
+
+[dependencies]
+redbookmaster-lib = { path = "../redbookmaster-lib" }
+slint = "1.9"
+rodio = "0.19"
+rfd = "0.15"
+crossbeam-channel = "0.5"
+parking_lot = "0.12"
+
+[build-dependencies]
+slint-build = "1.9"
