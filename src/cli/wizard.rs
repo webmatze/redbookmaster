@@ -1431,24 +1431,82 @@ fn burn_cd(project: &mut Project) {
             return;
         }
         Err(e) => {
-            println!("{} Failed to scan drives: {}", "⚠".yellow(), e);
-            println!("You can manually specify the device path.");
+            let error_str = e.to_string();
 
-            // Allow manual device entry
-            let device = match Text::new("CD drive device path:")
-                .with_default("/dev/sr0")
-                .with_help_message("e.g., /dev/sr0, /dev/cdrom, or SCSI address like 0,0,0")
-                .prompt()
-            {
-                Ok(d) => d.trim().to_string(),
-                Err(_) => return,
-            };
+            // Check if drive is in use (common on macOS)
+            if error_str.contains("Device already in use") || error_str.contains("unmount") {
+                println!("{} Drive is busy - disc is mounted by the system.", "⚠".yellow());
+                println!();
 
-            vec![CdDrive {
-                device,
-                vendor: "Unknown".to_string(),
-                model: "Manual entry".to_string(),
-            }]
+                // Try to unmount on macOS
+                #[cfg(target_os = "macos")]
+                {
+                    println!("Attempting to unmount disc...");
+
+                    // Get mounted optical discs
+                    if let Ok(output) = std::process::Command::new("diskutil")
+                        .args(["list"])
+                        .output()
+                    {
+                        let stdout = String::from_utf8_lossy(&output.stdout);
+                        // Find external disks that might be optical
+                        for line in stdout.lines() {
+                            if line.contains("/dev/disk") && line.contains("external") {
+                                if let Some(disk) = line.split_whitespace().next() {
+                                    let disk = disk.trim_start_matches("/dev/");
+                                    println!("  Unmounting {}...", disk);
+                                    let _ = std::process::Command::new("diskutil")
+                                        .args(["unmount", &format!("/dev/{}", disk)])
+                                        .output();
+                                }
+                            }
+                        }
+                    }
+
+                    // Try scanning again
+                    println!();
+                    println!("Retrying scan...");
+                    match cdrdao::list_drives() {
+                        Ok(d) if !d.is_empty() => d,
+                        Ok(_) => {
+                            println!("{} Still no drives found after unmount.", "✗".red());
+                            return;
+                        }
+                        Err(e2) => {
+                            println!("{} Still failed: {}", "✗".red(), e2);
+                            println!();
+                            println!("Try manually ejecting the disc and inserting a blank CD-R.");
+                            return;
+                        }
+                    }
+                }
+
+                #[cfg(not(target_os = "macos"))]
+                {
+                    println!("Please unmount the disc first:");
+                    println!("  sudo umount /dev/sr0");
+                    return;
+                }
+            } else {
+                println!("{} Failed to scan drives: {}", "⚠".yellow(), e);
+                println!("You can manually specify the device path.");
+
+                // Allow manual device entry
+                let device = match Text::new("CD drive device path:")
+                    .with_default("/dev/sr0")
+                    .with_help_message("e.g., /dev/sr0, /dev/cdrom, or SCSI address like 0,0,0")
+                    .prompt()
+                {
+                    Ok(d) => d.trim().to_string(),
+                    Err(_) => return,
+                };
+
+                vec![CdDrive {
+                    device,
+                    vendor: "Unknown".to_string(),
+                    model: "Manual entry".to_string(),
+                }]
+            }
         }
     };
 
