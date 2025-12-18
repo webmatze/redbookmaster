@@ -207,25 +207,36 @@ fn main() -> Result<(), slint::PlatformError> {
     let app_weak = app.as_weak();
     let state_clone = state.clone();
     app.on_save_project(move || {
-        let state = state_clone.borrow();
-        if let Some(ref project) = state.project {
-            if let Some(ref path) = state.project_path {
-                match project.save_to(path) {
-                    Ok(()) => {
-                        if let Some(app) = app_weak.upgrade() {
-                            app.set_status_message("Project saved".into());
+        let has_path = {
+            let state = state_clone.borrow();
+            if state.project.is_none() {
+                return;
+            }
+            state.project_path.is_some()
+        };
+
+        if has_path {
+            let state = state_clone.borrow();
+            if let Some(ref project) = state.project {
+                if let Some(ref path) = state.project_path {
+                    match project.save_to(path) {
+                        Ok(()) => {
+                            if let Some(app) = app_weak.upgrade() {
+                                app.set_status_message("Project saved".into());
+                            }
                         }
-                    }
-                    Err(e) => {
-                        if let Some(app) = app_weak.upgrade() {
-                            app.set_status_message(format!("Save failed: {}", e).into());
+                        Err(e) => {
+                            if let Some(app) = app_weak.upgrade() {
+                                app.set_status_message(format!("Save failed: {}", e).into());
+                            }
                         }
                     }
                 }
-            } else {
-                // No path set, trigger Save As
-                drop(state);
-                // TODO: Implement save as dialog
+            }
+        } else {
+            // No path set, trigger Save As
+            if let Some(app) = app_weak.upgrade() {
+                app.invoke_save_project_as();
             }
         }
     });
@@ -807,9 +818,44 @@ fn main() -> Result<(), slint::PlatformError> {
         }
     });
 
-    app.on_save_project_as(|| {
-        println!("Save As clicked");
-        // TODO: Implement save as dialog
+    let state_clone = state.clone();
+    let app_weak = app.as_weak();
+    app.on_save_project_as(move || {
+        let mut state = state_clone.borrow_mut();
+        let Some(ref project) = state.project else {
+            if let Some(app) = app_weak.upgrade() {
+                app.set_status_message("No project to save".into());
+            }
+            return;
+        };
+
+        // Open save dialog
+        let dialog = rfd::FileDialog::new()
+            .add_filter("Red Book Master Project", &["rbm"])
+            .set_title("Save Project As")
+            .set_file_name(
+                state.project_path
+                    .as_ref()
+                    .and_then(|p| p.file_name())
+                    .and_then(|n| n.to_str())
+                    .unwrap_or("untitled.rbm")
+            );
+
+        if let Some(path) = dialog.save_file() {
+            match project.save_to(&path) {
+                Ok(()) => {
+                    state.project_path = Some(path.clone());
+                    if let Some(app) = app_weak.upgrade() {
+                        app.set_status_message(format!("Saved: {}", path.display()).into());
+                    }
+                }
+                Err(e) => {
+                    if let Some(app) = app_weak.upgrade() {
+                        app.set_status_message(format!("Save failed: {}", e).into());
+                    }
+                }
+            }
+        }
     });
 
     let state_clone = state.clone();

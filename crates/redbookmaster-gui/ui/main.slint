@@ -151,6 +151,7 @@ export component MainWindow inherits Window {
     min-width: 1200px;
     min-height: 700px;
     background: Theme.background;
+    forward-focus: keyboard-scope;
 
     // Callbacks for Rust backend
     callback new-project();
@@ -184,7 +185,7 @@ export component MainWindow inherits Window {
     in property <AlbumData> album: { title: "Untitled Album", performer: "", songwriter: "", catalog: "" };
     in-out property <PlaybackState> playback: { is-playing: false, is-paused: false, current-track: -1, position: 0, duration: 0, volume: 0.8 };
     in-out property <int> selected-track-index: -1;
-    in property <string> status-message: "Ready";
+    in-out property <string> status-message: "Ready";
     in property <[WaveformPeak]> waveform-peaks: [];
     in property <string> waveform-duration: "0:00";
     in property <bool> waveform-loading: false;
@@ -209,11 +210,14 @@ export component MainWindow inherits Window {
     }
 
     // Keyboard shortcuts handler
-    FocusScope {
+    keyboard-scope := FocusScope {
         key-pressed(event) => {
+            // On macOS, Slint maps Command to 'control' and Control to 'meta' (swapped)
+            // So we use event.modifiers.control for Command key shortcuts
+
             // Space: Play/Pause toggle
-            if (event.text == " ") {
-                if (root.playback.is-playing) {
+            if (event.text == Key.Space || event.text == " ") {
+                if (root.playback.is-playing && !root.playback.is-paused) {
                     root.pause();
                 } else {
                     root.play();
@@ -246,18 +250,18 @@ export component MainWindow inherits Window {
                 }
                 return accept;
             }
-            // Cmd+N: New project (macOS)
-            if (event.modifiers.meta && event.text == "n") {
+            // Cmd+N: New project (macOS - Command maps to control modifier)
+            if (event.modifiers.control && event.text == "n") {
                 root.new-project();
                 return accept;
             }
             // Cmd+O: Open project (macOS)
-            if (event.modifiers.meta && event.text == "o") {
+            if (event.modifiers.control && event.text == "o") {
                 root.open-project();
                 return accept;
             }
-            // Cmd+S: Save project (macOS)
-            if (event.modifiers.meta && event.text == "s") {
+            // Cmd+S / Cmd+Shift+S: Save project (macOS)
+            if (event.modifiers.control && (event.text == "s" || event.text == "S")) {
                 if (event.modifiers.shift) {
                     root.save-project-as();
                 } else {
