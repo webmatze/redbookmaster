@@ -648,12 +648,17 @@ export component MainWindow inherits Window {
 
                         // Play/Pause button
                         Rectangle {
+                            property <bool> enabled: root.tracks.length > 0;
+
                             width: 48px;
                             height: 48px;
                             border-radius: 24px;
-                            background: play-touch.has-hover ? Theme.accent-hover : Theme.accent;
+                            background: !enabled ? Theme.button-background :
+                                        play-touch.has-hover ? Theme.accent-hover : Theme.accent;
+                            opacity: enabled ? 1.0 : 0.5;
 
                             play-touch := TouchArea {
+                                enabled: parent.enabled;
                                 clicked => {
                                     if root.playback.is-playing && !root.playback.is-paused {
                                         root.pause();
@@ -675,12 +680,16 @@ export component MainWindow inherits Window {
 
                         // Stop button
                         Rectangle {
+                            property <bool> enabled: root.tracks.length > 0;
+
                             width: 36px;
                             height: 36px;
                             border-radius: 4px;
-                            background: stop-touch.has-hover ? Theme.button-hover : Theme.button-background;
+                            background: stop-touch.has-hover && enabled ? Theme.button-hover : Theme.button-background;
+                            opacity: enabled ? 1.0 : 0.5;
 
                             stop-touch := TouchArea {
+                                enabled: parent.enabled;
                                 clicked => { root.stop(); }
                             }
 

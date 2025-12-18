@@ -383,9 +383,52 @@ fn main() -> Result<(), slint::PlatformError> {
     // Playback callbacks
     let engine_clone = audio_engine.clone();
     let app_weak = app.as_weak();
+    let state_clone = state.clone();
     app.on_play(move || {
-        engine_clone.play();
         if let Some(app) = app_weak.upgrade() {
+            let tracks = app.get_tracks();
+
+            // Don't play if there are no tracks
+            if tracks.row_count() == 0 {
+                return;
+            }
+
+            // Auto-select first track if none is selected
+            let selected_index = app.get_selected_track_index();
+            if selected_index < 0 {
+                // Select the first track
+                if let Some(first_track) = tracks.row_data(0) {
+                    let track_num = first_track.number as u8;
+
+                    // Get track path and load into engine
+                    let mut state = state_clone.borrow_mut();
+                    if let Some(track) = state.get_track(track_num) {
+                        let path = track.source_file.clone();
+                        state.current_track_path = Some(path.clone());
+                        state.current_track_num = Some(track_num);
+                        engine_clone.load(path);
+                    }
+
+                    // Extract waveform
+                    if let Some(cache) = state.extract_waveform(track_num) {
+                        let peaks = cache.peaks.clone();
+                        let duration = cache.duration_str.clone();
+
+                        let model = Rc::new(slint::VecModel::from(peaks));
+                        app.set_waveform_peaks(model.into());
+                        app.set_waveform_duration(duration.into());
+                    }
+
+                    app.set_selected_track_index(0);
+                    app.set_playhead_position(0.0);
+                    drop(state);
+
+                    // Small delay to allow track to load before playing
+                    // The audio engine will handle the play command once loaded
+                }
+            }
+
+            engine_clone.play();
             let mut playback = app.get_playback();
             playback.is_playing = true;
             playback.is_paused = false;
