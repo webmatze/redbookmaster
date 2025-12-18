@@ -454,6 +454,34 @@ export component MainWindow inherits Window {
                                 vertical-alignment: center;
                             }
                         }
+
+                        // Remove track button
+                        Rectangle {
+                            property <bool> enabled: root.selected-track-index >= 0;
+                            width: 28px;
+                            height: 28px;
+                            border-radius: 4px;
+                            background: !enabled ? Theme.button-background :
+                                        remove-touch.has-hover ? Theme.button-hover : Theme.button-background;
+                            opacity: enabled ? 1.0 : 0.4;
+
+                            remove-touch := TouchArea {
+                                enabled: parent.enabled;
+                                clicked => {
+                                    if (root.selected-track-index >= 0) {
+                                        root.remove-track(root.tracks[root.selected-track-index].number);
+                                    }
+                                }
+                            }
+
+                            Text {
+                                text: "−";
+                                color: Theme.text-primary;
+                                font-size: 18px;
+                                horizontal-alignment: center;
+                                vertical-alignment: center;
+                            }
+                        }
                     }
 
                     // Track list header
