@@ -291,12 +291,16 @@ fn main() -> Result<(), slint::PlatformError> {
         let mut state = state_clone.borrow_mut();
 
         if let Some(app) = app_weak.upgrade() {
-            // Find the track index
+            // Find the track index and update metadata editor
             let tracks = app.get_tracks();
             for i in 0..tracks.row_count() {
                 if let Some(track) = tracks.row_data(i) {
                     if track.number == track_num {
                         app.set_selected_track_index(i as i32);
+
+                        // Update metadata editor fields
+                        app.set_current_track_title(track.title.clone());
+                        app.set_current_track_pregap(track.pregap.clone());
                         break;
                     }
                 }
@@ -399,6 +403,10 @@ fn main() -> Result<(), slint::PlatformError> {
                 // Select the first track
                 if let Some(first_track) = tracks.row_data(0) {
                     let track_num = first_track.number as u8;
+
+                    // Update metadata editor fields
+                    app.set_current_track_title(first_track.title.clone());
+                    app.set_current_track_pregap(first_track.pregap.clone());
 
                     // Get track path and load into engine
                     let mut state = state_clone.borrow_mut();
@@ -511,9 +519,22 @@ fn main() -> Result<(), slint::PlatformError> {
         // TODO: Implement track removal
     });
 
-    app.on_update_track_pregap(|track_num, pregap| {
-        println!("Update pregap for track {}: {}", track_num, pregap);
-        // TODO: Implement pregap update
+    let state_clone = state.clone();
+    let app_weak = app.as_weak();
+    app.on_update_track_pregap(move |track_num, pregap| {
+        let mut state = state_clone.borrow_mut();
+        if let Some(ref mut project) = state.project {
+            if let Ok(secs) = pregap.parse::<u64>() {
+                if let Some(track) = project.album.get_track_mut(track_num as u8) {
+                    track.pregap = std::time::Duration::from_secs(secs);
+                    if let Some(app) = app_weak.upgrade() {
+                        let tracks: Vec<TrackData> = state.tracks_to_model();
+                        let model = Rc::new(slint::VecModel::from(tracks));
+                        app.set_tracks(model.into());
+                    }
+                }
+            }
+        }
     });
 
     // Set up a timer to poll for position updates from the audio engine
@@ -570,6 +591,10 @@ fn main() -> Result<(), slint::PlatformError> {
                             // There's a next track - select and play it
                             if let Some(next_track) = tracks.row_data(next_index as usize) {
                                 let track_num = next_track.number as u8;
+
+                                // Update metadata editor fields
+                                app.set_current_track_title(next_track.title.clone());
+                                app.set_current_track_pregap(next_track.pregap.clone());
 
                                 // Load the next track
                                 let mut state = state_for_timer.borrow_mut();

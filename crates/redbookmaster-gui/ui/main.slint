@@ -182,12 +182,16 @@ export component MainWindow inherits Window {
     in property <[TrackData]> tracks: [];
     in property <AlbumData> album: { title: "Untitled Album", performer: "", songwriter: "", catalog: "" };
     in-out property <PlaybackState> playback: { is-playing: false, is-paused: false, current-track: -1, position: 0, duration: 0, volume: 0.8 };
-    in property <int> selected-track-index: -1;
+    in-out property <int> selected-track-index: -1;
     in property <string> status-message: "Ready";
     in property <[WaveformPeak]> waveform-peaks: [];
     in property <string> waveform-duration: "0:00";
     in property <bool> waveform-loading: false;
     in-out property <float> playhead-position: 0.0;
+
+    // Currently edited track metadata
+    in-out property <string> current-track-title: "";
+    in-out property <string> current-track-pregap: "0";
 
     // Internal state
     property <int> hover-track: -1;
@@ -805,11 +809,10 @@ export component MainWindow inherits Window {
                                 border-radius: 4px;
 
                                 LineEdit {
-                                    text: root.selected-track-index >= 0 && root.selected-track-index < root.tracks.length ?
-                                          root.tracks[root.selected-track-index].title : "";
+                                    text <=> root.current-track-title;
                                     enabled: root.selected-track-index >= 0;
                                     edited(text) => {
-                                        if root.selected-track-index >= 0 {
+                                        if root.selected-track-index >= 0 && root.selected-track-index < root.tracks.length {
                                             root.update-track-title(root.tracks[root.selected-track-index].number, text);
                                         }
                                     }
@@ -832,11 +835,10 @@ export component MainWindow inherits Window {
                                 border-radius: 4px;
 
                                 LineEdit {
-                                    text: root.selected-track-index >= 0 && root.selected-track-index < root.tracks.length ?
-                                          root.tracks[root.selected-track-index].pregap : "0";
+                                    text <=> root.current-track-pregap;
                                     enabled: root.selected-track-index >= 0;
                                     edited(text) => {
-                                        if root.selected-track-index >= 0 {
+                                        if root.selected-track-index >= 0 && root.selected-track-index < root.tracks.length {
                                             root.update-track-pregap(root.tracks[root.selected-track-index].number, text);
                                         }
                                     }
