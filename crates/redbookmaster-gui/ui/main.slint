@@ -13,8 +13,9 @@ export global Theme {
     out property <color> text-primary: #ffffff;
     out property <color> text-secondary: #a0a0a0;
     out property <color> text-dimmed: #606060;
-    out property <color> waveform-fill: #0066cc40;
+    out property <color> waveform-fill: #0066cc60;
     out property <color> waveform-stroke: #0088ff;
+    out property <color> waveform-center: #404040;
     out property <color> playhead: #ff4444;
     out property <color> selection: #0066cc40;
     out property <color> button-background: #333333;
@@ -33,6 +34,12 @@ export struct TrackData {
     selected: bool,
 }
 
+// Waveform peak data (min, max pairs normalized to -1.0 to 1.0)
+export struct WaveformPeak {
+    min: float,
+    max: float,
+}
+
 // Album metadata
 export struct AlbumData {
     title: string,
@@ -49,6 +56,93 @@ export struct PlaybackState {
     position: float,
     duration: float,
     volume: float,
+}
+
+// Waveform display component
+component WaveformView inherits Rectangle {
+    in property <[WaveformPeak]> peaks: [];
+    in-out property <float> playhead-position: 0.0;  // 0.0 to 1.0
+    in property <float> zoom: 1.0;
+    in property <float> scroll-offset: 0.0;  // 0.0 to 1.0
+    in property <bool> is-playing: false;
+
+    callback seek(float);
+
+    background: Theme.input-background;
+    border-radius: 4px;
+
+    // Center line
+    Rectangle {
+        y: (parent.height - 1px) / 2;
+        width: parent.width;
+        height: 1px;
+        background: Theme.waveform-center;
+    }
+
+    // Waveform bars
+    HorizontalLayout {
+        padding: 2px;
+        spacing: 0px;
+
+        for peak[idx] in root.peaks: Rectangle {
+            horizontal-stretch: 1;
+
+            Rectangle {
+                // Position bar vertically centered based on peak values
+                property <length> center-y: parent.height / 2;
+                property <length> max-amplitude: parent.height / 2 - 4px;
+
+                x: 0;
+                y: center-y - (peak.max * max-amplitude);
+                width: parent.width;
+                height: (peak.max - peak.min) * max-amplitude;
+
+                background: Theme.waveform-fill;
+                border-radius: 1px;
+            }
+        }
+    }
+
+    // Playhead - always visible when we have peaks
+    if root.peaks.length > 0: Rectangle {
+        x: max(0px, min(parent.width - 2px, root.playhead-position * parent.width - 1px));
+        y: 0;
+        width: 2px;
+        height: parent.height;
+        background: Theme.playhead;
+
+        // Playhead handle/knob at top
+        Rectangle {
+            x: -4px;
+            y: 0;
+            width: 10px;
+            height: 10px;
+            border-radius: 5px;
+            background: Theme.playhead;
+        }
+    }
+
+    // Click to seek
+    TouchArea {
+        clicked => {
+            root.playhead-position = max(0.0, min(1.0, self.mouse-x / parent.width));
+            root.seek(root.playhead-position);
+        }
+        moved => {
+            if self.pressed {
+                root.playhead-position = max(0.0, min(1.0, self.mouse-x / parent.width));
+            }
+        }
+    }
+
+    // Empty state
+    if root.peaks.length == 0: Text {
+        text: "No waveform data";
+        color: Theme.text-dimmed;
+        font-size: 13px;
+        horizontal-alignment: center;
+        vertical-alignment: center;
+    }
 }
 
 // Main application window
@@ -80,15 +174,23 @@ export component MainWindow inherits Window {
     callback update-album-title(string);
     callback update-album-performer(string);
 
+    callback waveform-seek(float);
+    callback zoom-in();
+    callback zoom-out();
+
     // Properties bound to Rust
     in property <[TrackData]> tracks: [];
     in property <AlbumData> album: { title: "Untitled Album", performer: "", songwriter: "", catalog: "" };
     in property <PlaybackState> playback: { is-playing: false, is-paused: false, current-track: -1, position: 0, duration: 0, volume: 0.8 };
     in property <int> selected-track-index: -1;
     in property <string> status-message: "Ready";
+    in property <[WaveformPeak]> waveform-peaks: [];
+    in property <string> waveform-duration: "0:00";
+    in property <bool> waveform-loading: false;
 
     // Internal state
     property <int> hover-track: -1;
+    property <float> zoom-level: 1.0;
 
     VerticalLayout {
         // Menu bar
@@ -407,27 +509,119 @@ export component MainWindow inherits Window {
 
                             Rectangle { horizontal-stretch: 1; }
 
-                            // Zoom controls (placeholder)
+                            // Duration
                             Text {
-                                text: "Zoom: 1x";
+                                text: root.waveform-duration;
                                 color: Theme.text-secondary;
                                 font-size: 12px;
                             }
+
+                            Rectangle { width: 16px; }
+
+                            // Zoom controls
+                            HorizontalLayout {
+                                spacing: 4px;
+
+                                Text {
+                                    text: "Zoom:";
+                                    color: Theme.text-secondary;
+                                    font-size: 12px;
+                                    vertical-alignment: center;
+                                }
+
+                                Rectangle {
+                                    width: 24px;
+                                    height: 24px;
+                                    border-radius: 4px;
+                                    background: zoom-out-touch.has-hover ? Theme.button-hover : Theme.button-background;
+
+                                    zoom-out-touch := TouchArea {
+                                        clicked => {
+                                            root.zoom-level = max(1.0, root.zoom-level / 2.0);
+                                            root.zoom-out();
+                                        }
+                                    }
+
+                                    Text {
+                                        text: "-";
+                                        color: Theme.text-primary;
+                                        font-size: 14px;
+                                        horizontal-alignment: center;
+                                        vertical-alignment: center;
+                                    }
+                                }
+
+                                Text {
+                                    text: root.zoom-level + "x";
+                                    color: Theme.text-primary;
+                                    font-size: 12px;
+                                    vertical-alignment: center;
+                                    min-width: 30px;
+                                    horizontal-alignment: center;
+                                }
+
+                                Rectangle {
+                                    width: 24px;
+                                    height: 24px;
+                                    border-radius: 4px;
+                                    background: zoom-in-touch.has-hover ? Theme.button-hover : Theme.button-background;
+
+                                    zoom-in-touch := TouchArea {
+                                        clicked => {
+                                            root.zoom-level = min(16.0, root.zoom-level * 2.0);
+                                            root.zoom-in();
+                                        }
+                                    }
+
+                                    Text {
+                                        text: "+";
+                                        color: Theme.text-primary;
+                                        font-size: 14px;
+                                        horizontal-alignment: center;
+                                        vertical-alignment: center;
+                                    }
+                                }
+                            }
                         }
 
-                        // Waveform display area
-                        Rectangle {
+                        // Waveform display
+                        if root.waveform-loading: Rectangle {
                             vertical-stretch: 1;
                             background: Theme.input-background;
                             border-radius: 4px;
 
-                            // Placeholder waveform
                             Text {
-                                text: root.selected-track-index >= 0 ? "Waveform will be displayed here" : "Select a track to view waveform";
+                                text: "Loading waveform...";
                                 color: Theme.text-dimmed;
                                 font-size: 13px;
                                 horizontal-alignment: center;
                                 vertical-alignment: center;
+                            }
+                        }
+
+                        if !root.waveform-loading && root.selected-track-index < 0: Rectangle {
+                            vertical-stretch: 1;
+                            background: Theme.input-background;
+                            border-radius: 4px;
+
+                            Text {
+                                text: "Select a track to view waveform";
+                                color: Theme.text-dimmed;
+                                font-size: 13px;
+                                horizontal-alignment: center;
+                                vertical-alignment: center;
+                            }
+                        }
+
+                        if !root.waveform-loading && root.selected-track-index >= 0: WaveformView {
+                            vertical-stretch: 1;
+                            peaks: root.waveform-peaks;
+                            playhead-position: root.playback.duration > 0 ? root.playback.position / root.playback.duration : 0.0;
+                            is-playing: root.playback.is-playing;
+                            zoom: root.zoom-level;
+
+                            seek(pos) => {
+                                root.waveform-seek(pos);
                             }
                         }
                     }
@@ -499,7 +693,7 @@ export component MainWindow inherits Window {
                             alignment: center;
 
                             Text {
-                                text: "0:00 / 0:00";
+                                text: "0:00 / " + root.waveform-duration;
                                 color: Theme.text-primary;
                                 font-size: 14px;
                                 font-family: "monospace";

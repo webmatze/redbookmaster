@@ -5,16 +5,27 @@ use std::rc::Rc;
 use std::cell::RefCell;
 use std::path::PathBuf;
 
-use redbookmaster_lib::{Album, Project, Track};
+use redbookmaster_lib::{Album, Project, Track, extract_peaks};
 use redbookmaster_lib::core::track::format_duration_ms;
 use slint::Model;
 
 slint::include_modules!();
 
+/// Number of waveform peaks to display
+const WAVEFORM_BINS: usize = 500;
+
 /// Application state
 struct AppState {
     project: Option<Project>,
     project_path: Option<PathBuf>,
+    current_waveform: Option<WaveformCache>,
+}
+
+/// Cached waveform data
+struct WaveformCache {
+    track_number: u8,
+    peaks: Vec<WaveformPeak>,
+    duration_str: String,
 }
 
 impl AppState {
@@ -22,6 +33,7 @@ impl AppState {
         Self {
             project: None,
             project_path: None,
+            current_waveform: None,
         }
     }
 
@@ -30,6 +42,7 @@ impl AppState {
         let project = Project::new(album);
         self.project = Some(project);
         self.project_path = None;
+        self.current_waveform = None;
     }
 
     fn tracks_to_model(&self) -> Vec<TrackData> {
@@ -61,6 +74,47 @@ impl AppState {
             catalog: project.album.catalog.as_ref().map(|c| c.to_string()).unwrap_or_default().into(),
         }
     }
+
+    /// Get the track for a given track number
+    fn get_track(&self, track_num: u8) -> Option<&Track> {
+        self.project.as_ref()?.album.get_track(track_num)
+    }
+
+    /// Extract waveform for a track
+    fn extract_waveform(&mut self, track_num: u8) -> Option<&WaveformCache> {
+        // Check if we already have this waveform cached
+        if let Some(ref cache) = self.current_waveform {
+            if cache.track_number == track_num {
+                return self.current_waveform.as_ref();
+            }
+        }
+
+        // Get the track
+        let track = self.get_track(track_num)?;
+        let path = &track.source_file;
+        let duration = track.duration;
+
+        // Extract peaks
+        match extract_peaks(path, WAVEFORM_BINS) {
+            Ok(waveform_data) => {
+                let peaks: Vec<WaveformPeak> = waveform_data.peaks.iter().map(|&(min, max)| {
+                    WaveformPeak { min, max }
+                }).collect();
+
+                self.current_waveform = Some(WaveformCache {
+                    track_number: track_num,
+                    peaks,
+                    duration_str: format_duration_ms(duration),
+                });
+
+                self.current_waveform.as_ref()
+            }
+            Err(e) => {
+                eprintln!("Failed to extract waveform: {}", e);
+                None
+            }
+        }
+    }
 }
 
 fn main() -> Result<(), slint::PlatformError> {
@@ -84,6 +138,9 @@ fn main() -> Result<(), slint::PlatformError> {
             app.set_album(state.album_to_model());
             app.set_status_message("New project created".into());
             app.set_selected_track_index(-1);
+            // Clear waveform
+            app.set_waveform_peaks(Rc::new(slint::VecModel::from(Vec::<WaveformPeak>::new())).into());
+            app.set_waveform_duration("0:00".into());
         }
     });
 
@@ -100,6 +157,7 @@ fn main() -> Result<(), slint::PlatformError> {
                     let mut state = state_clone.borrow_mut();
                     state.project = Some(project);
                     state.project_path = Some(path.clone());
+                    state.current_waveform = None;
 
                     if let Some(app) = app_weak.upgrade() {
                         let tracks: Vec<TrackData> = state.tracks_to_model();
@@ -108,6 +166,9 @@ fn main() -> Result<(), slint::PlatformError> {
                         app.set_album(state.album_to_model());
                         app.set_status_message(format!("Opened: {}", path.display()).into());
                         app.set_selected_track_index(-1);
+                        // Clear waveform
+                        app.set_waveform_peaks(Rc::new(slint::VecModel::from(Vec::<WaveformPeak>::new())).into());
+                        app.set_waveform_duration("0:00".into());
                     }
                 }
                 Err(e) => {
@@ -202,9 +263,14 @@ fn main() -> Result<(), slint::PlatformError> {
         }
     });
 
+    // Track selection with waveform extraction
     let app_weak = app.as_weak();
+    let state_clone = state.clone();
     app.on_select_track(move |track_num| {
+        let mut state = state_clone.borrow_mut();
+
         if let Some(app) = app_weak.upgrade() {
+            // Find the track index
             let tracks = app.get_tracks();
             for i in 0..tracks.row_count() {
                 if let Some(track) = tracks.row_data(i) {
@@ -213,6 +279,29 @@ fn main() -> Result<(), slint::PlatformError> {
                         break;
                     }
                 }
+            }
+
+            // Show loading state
+            app.set_waveform_loading(true);
+            app.set_status_message(format!("Loading waveform for track {}...", track_num).into());
+        }
+
+        // Extract waveform
+        if let Some(cache) = state.extract_waveform(track_num as u8) {
+            if let Some(app) = app_weak.upgrade() {
+                let peaks = cache.peaks.clone();
+                let duration = cache.duration_str.clone();
+
+                let model = Rc::new(slint::VecModel::from(peaks));
+                app.set_waveform_peaks(model.into());
+                app.set_waveform_duration(duration.into());
+                app.set_waveform_loading(false);
+                app.set_status_message(format!("Track {} selected", track_num).into());
+            }
+        } else {
+            if let Some(app) = app_weak.upgrade() {
+                app.set_waveform_loading(false);
+                app.set_status_message("Failed to load waveform".into());
             }
         }
     });
@@ -276,6 +365,19 @@ fn main() -> Result<(), slint::PlatformError> {
 
     app.on_set_volume(|vol| {
         println!("Volume: {}", vol);
+    });
+
+    app.on_waveform_seek(|pos| {
+        println!("Waveform seek to: {:.2}", pos);
+        // TODO: Implement seek in playback
+    });
+
+    app.on_zoom_in(|| {
+        println!("Zoom in");
+    });
+
+    app.on_zoom_out(|| {
+        println!("Zoom out");
     });
 
     app.on_export_master(|| {
