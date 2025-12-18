@@ -10,6 +10,9 @@ use std::sync::Arc;
 
 use redbookmaster_lib::{Album, Project, Track, extract_peaks};
 use redbookmaster_lib::core::track::format_duration_ms;
+use redbookmaster_lib::audio::concat::concatenate_tracks;
+use redbookmaster_lib::{generate_cue, generate_toc};
+use redbookmaster_lib::{Cdrdao, BurnOptions, cdrdao_available, list_drives};
 use slint::Model;
 
 use player::{AudioEngine, PlayerEvent};
@@ -499,14 +502,309 @@ fn main() -> Result<(), slint::PlatformError> {
         println!("Zoom out");
     });
 
-    app.on_export_master(|| {
-        println!("Export clicked");
-        // TODO: Implement export dialog
+    let state_clone = state.clone();
+    let app_weak = app.as_weak();
+    app.on_export_master(move || {
+        let state = state_clone.borrow();
+        let Some(ref project) = state.project else {
+            if let Some(app) = app_weak.upgrade() {
+                app.set_status_message("No project to export".into());
+            }
+            return;
+        };
+
+        if project.album.tracks.is_empty() {
+            if let Some(app) = app_weak.upgrade() {
+                app.set_status_message("No tracks to export".into());
+            }
+            return;
+        }
+
+        // Validate album
+        if let Err(e) = project.album.validate() {
+            if let Some(app) = app_weak.upgrade() {
+                app.set_status_message(format!("Validation failed: {}", e).into());
+            }
+            return;
+        }
+
+        // Open folder selection dialog
+        let dialog = rfd::FileDialog::new()
+            .set_title("Select Export Directory");
+
+        let Some(output_dir) = dialog.pick_folder() else {
+            return;
+        };
+
+        if let Some(app) = app_weak.upgrade() {
+            app.set_status_message("Exporting...".into());
+        }
+
+        // Generate filenames based on album title
+        let base_name = project.album.title.replace(|c: char| !c.is_alphanumeric() && c != ' ', "")
+            .replace(' ', "_")
+            .to_lowercase();
+        let base_name = if base_name.is_empty() { "master".to_string() } else { base_name };
+
+        let wav_path = output_dir.join(format!("{}.wav", base_name));
+        let cue_path = output_dir.join(format!("{}.cue", base_name));
+        let toc_path = output_dir.join(format!("{}.toc", base_name));
+
+        // Step 1: Concatenate tracks into master WAV
+        if let Some(app) = app_weak.upgrade() {
+            app.set_status_message("Creating master WAV file...".into());
+        }
+
+        if let Err(e) = concatenate_tracks(&project.album.tracks, &wav_path) {
+            if let Some(app) = app_weak.upgrade() {
+                app.set_status_message(format!("Export failed: {}", e).into());
+            }
+            return;
+        }
+
+        // Step 2: Generate CUE sheet
+        if let Some(app) = app_weak.upgrade() {
+            app.set_status_message("Generating CUE sheet...".into());
+        }
+
+        let wav_filename = wav_path.file_name().unwrap().to_str().unwrap();
+        if let Err(e) = generate_cue(&project.album, wav_filename, &cue_path) {
+            if let Some(app) = app_weak.upgrade() {
+                app.set_status_message(format!("CUE generation failed: {}", e).into());
+            }
+            return;
+        }
+
+        // Step 3: Generate TOC file for cdrdao
+        if let Some(app) = app_weak.upgrade() {
+            app.set_status_message("Generating TOC file...".into());
+        }
+
+        if let Err(e) = generate_toc(&project.album, wav_filename, &toc_path) {
+            if let Some(app) = app_weak.upgrade() {
+                app.set_status_message(format!("TOC generation failed: {}", e).into());
+            }
+            return;
+        }
+
+        // Success!
+        if let Some(app) = app_weak.upgrade() {
+            app.set_status_message(format!("Exported to {}", output_dir.display()).into());
+        }
     });
 
-    app.on_burn_cd(|| {
-        println!("Burn CD clicked");
-        // TODO: Implement burn dialog
+    let state_clone = state.clone();
+    let app_weak = app.as_weak();
+    app.on_burn_cd(move || {
+        // Check if cdrdao is available
+        if !cdrdao_available() {
+            if let Some(app) = app_weak.upgrade() {
+                app.set_status_message("cdrdao not installed. Install it with: brew install cdrdao".into());
+            }
+            return;
+        }
+
+        let state = state_clone.borrow();
+        let Some(ref project) = state.project else {
+            if let Some(app) = app_weak.upgrade() {
+                app.set_status_message("No project loaded".into());
+            }
+            return;
+        };
+
+        if project.album.tracks.is_empty() {
+            if let Some(app) = app_weak.upgrade() {
+                app.set_status_message("No tracks to burn".into());
+            }
+            return;
+        }
+
+        // On macOS, unmount any mounted optical discs first
+        #[cfg(target_os = "macos")]
+        {
+            if let Some(app) = app_weak.upgrade() {
+                app.set_status_message("Unmounting disc...".into());
+            }
+            // Find and unmount optical discs using diskutil
+            if let Ok(output) = std::process::Command::new("diskutil").args(["list"]).output() {
+                let stdout = String::from_utf8_lossy(&output.stdout);
+                for line in stdout.lines() {
+                    // Look for external/optical drives (typically disk1, disk2, etc.)
+                    if line.contains("/dev/disk") && !line.contains("disk0") {
+                        if let Some(disk) = line.split_whitespace().next() {
+                            let _ = std::process::Command::new("diskutil")
+                                .args(["unmountDisk", disk])
+                                .output();
+                        }
+                    }
+                }
+            }
+        }
+
+        // List available CD drives
+        let mut drives = list_drives().unwrap_or_default();
+
+        // On macOS, if no drives found via scanbus, try IORegistry detection
+        #[cfg(target_os = "macos")]
+        if drives.is_empty() {
+            if let Some(app) = app_weak.upgrade() {
+                app.set_status_message("Detecting CD drive via IORegistry...".into());
+            }
+            // Try to detect via ioreg
+            if let Ok(output) = std::process::Command::new("ioreg")
+                .args(["-c", "IOCDBlockStorageDevice", "-r", "-l"])
+                .output()
+            {
+                let stdout = String::from_utf8_lossy(&output.stdout);
+                if stdout.contains("IOCDBlockStorageDevice") {
+                    // Found an optical drive - use IOKit device path
+                    drives.push(redbookmaster_lib::CdDrive {
+                        device: "IOCompactDiscServices".to_string(),
+                        vendor: "Apple".to_string(),
+                        model: "Optical Drive".to_string(),
+                    });
+                }
+            }
+        }
+
+        if drives.is_empty() {
+            if let Some(app) = app_weak.upgrade() {
+                app.set_status_message("No CD drives found. Please close any disc dialogs and try again.".into());
+            }
+            return;
+        }
+
+        // Ask user to select TOC file
+        let dialog = rfd::FileDialog::new()
+            .set_title("Select TOC File to Burn")
+            .add_filter("TOC files", &["toc"]);
+
+        let Some(toc_path) = dialog.pick_file() else {
+            return;
+        };
+
+        if !toc_path.exists() {
+            if let Some(app) = app_weak.upgrade() {
+                app.set_status_message("TOC file not found. Please export first.".into());
+            }
+            return;
+        }
+
+        // Use first available drive
+        let drive = &drives[0];
+
+        // Ask about CD-TEXT mode
+        let cdtext_confirm = rfd::MessageDialog::new()
+            .set_title("CD-TEXT Mode")
+            .set_description("Enable CD-TEXT?\n\nCD-TEXT embeds track/album titles on the disc, but uses a driver mode that can fail on some drives.\n\nIf burning fails, try again with CD-TEXT disabled.")
+            .set_buttons(rfd::MessageButtons::YesNo)
+            .show();
+
+        let use_cdtext = cdtext_confirm == rfd::MessageDialogResult::Yes;
+
+        // Confirm burn
+        let confirm = rfd::MessageDialog::new()
+            .set_title("Burn CD")
+            .set_description(&format!(
+                "Burn to {} {}?\n\nDevice: {}\nCD-TEXT: {}\n\nMake sure:\n• A blank CD-R is inserted\n• Any system disc dialogs are closed\n\nClick OK to start burning.",
+                drive.vendor, drive.model, drive.device,
+                if use_cdtext { "Enabled" } else { "Disabled" }
+            ))
+            .set_buttons(rfd::MessageButtons::OkCancel)
+            .show();
+
+        if confirm != rfd::MessageDialogResult::Ok {
+            if let Some(app) = app_weak.upgrade() {
+                app.set_status_message("Burn cancelled".into());
+            }
+            return;
+        }
+
+        // Unmount again right before burning (in case macOS re-mounted)
+        #[cfg(target_os = "macos")]
+        {
+            if let Ok(output) = std::process::Command::new("diskutil").args(["list"]).output() {
+                let stdout = String::from_utf8_lossy(&output.stdout);
+                for line in stdout.lines() {
+                    if line.contains("/dev/disk") && !line.contains("disk0") {
+                        if let Some(disk) = line.split_whitespace().next() {
+                            let _ = std::process::Command::new("diskutil")
+                                .args(["unmountDisk", disk])
+                                .output();
+                        }
+                    }
+                }
+            }
+        }
+
+        if let Some(app) = app_weak.upgrade() {
+            app.set_status_message("Burning CD... (this may take several minutes)".into());
+        }
+
+        // Create burn options
+        let burn_options = BurnOptions {
+            device: drive.device.clone(),
+            speed: 0, // Auto
+            simulate: false,
+            eject: true,
+            force_raw_driver: use_cdtext, // Only use raw driver for CD-TEXT
+        };
+
+        let burner = Cdrdao::new(burn_options.clone());
+
+        println!("=== Starting CD burn ===");
+        println!("TOC file: {}", toc_path.display());
+        println!("Device: {}", burn_options.device);
+        println!("Speed: {} (0=auto)", burn_options.speed);
+        println!("CD-TEXT: {}", if burn_options.force_raw_driver { "Enabled (raw driver)" } else { "Disabled" });
+        println!("========================");
+        println!("TIP: If burn fails, try running with sudo:");
+        println!("  sudo cargo run -p redbookmaster-gui");
+        println!("========================");
+
+        // Burn!
+        match burner.burn(&toc_path) {
+            Ok(()) => {
+                println!("=== Burn completed successfully ===");
+                if let Some(app) = app_weak.upgrade() {
+                    app.set_status_message("CD burned successfully!".into());
+                }
+            }
+            Err(e) => {
+                let error_str = e.to_string();
+                println!("=== Burn failed ===");
+                println!("{}", error_str);
+                println!();
+                println!("SUGGESTIONS:");
+                if error_str.contains("Write data failed") {
+                    println!("  1. Try burning with CD-TEXT disabled");
+                    println!("  2. Try running with sudo: sudo cargo run -p redbookmaster-gui");
+                    println!("  3. Try a different CD-R disc");
+                    println!("  4. Try a slower burn speed");
+                }
+                if error_str.contains("Device already in use") || error_str.contains("Cannot grab") {
+                    println!("  - Close any Finder windows showing the disc");
+                    println!("  - Run: diskutil unmountDisk /dev/disk2 (or similar)");
+                }
+                println!("===================");
+
+                if let Some(app) = app_weak.upgrade() {
+                    if error_str.contains("Device already in use") || error_str.contains("Cannot grab") {
+                        app.set_status_message("Drive is busy. Close any disc dialogs and try again.".into());
+                    } else if error_str.contains("Write data failed") {
+                        app.set_status_message("Write failed. Try with CD-TEXT disabled or run with sudo. See console.".into());
+                    } else {
+                        // Show first 150 chars of error in status bar
+                        let short_error = if error_str.len() > 150 {
+                            format!("{}... (see console)", &error_str[..150])
+                        } else {
+                            error_str
+                        };
+                        app.set_status_message(format!("Burn failed: {}", short_error).into());
+                    }
+                }
+            }
+        }
     });
 
     app.on_save_project_as(|| {

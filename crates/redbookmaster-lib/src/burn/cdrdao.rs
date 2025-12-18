@@ -83,21 +83,41 @@ pub fn list_drives() -> Result<Vec<CdDrive>, CdrdaoError> {
         return Err(CdrdaoError::CommandFailed(stderr.to_string()));
     }
 
+    // cdrdao outputs drive info to stderr, not stdout (quirk of the tool)
+    let stderr = String::from_utf8_lossy(&output.stderr);
     let stdout = String::from_utf8_lossy(&output.stdout);
+    let combined = format!("{}{}", stdout, stderr);
     let mut drives = Vec::new();
 
     // Parse scanbus output
-    // Format: X,Y,Z : Vendor Model
-    for line in stdout.lines() {
-        if let Some((device, rest)) = line.split_once(':') {
-            let device = device.trim().to_string();
-            let parts: Vec<&str> = rest.trim().splitn(2, ' ').collect();
-            if parts.len() >= 2 {
-                drives.push(CdDrive {
-                    device,
-                    vendor: parts[0].to_string(),
-                    model: parts[1].to_string(),
-                });
+    // Linux format: X,Y,Z : Vendor Model
+    // macOS format: IOService:/long/path : VENDOR, Model, Version
+    for line in combined.lines() {
+        // Find the last " : " which separates device from info
+        if let Some(pos) = line.rfind(" : ") {
+            let device = line[..pos].trim().to_string();
+            let rest = line[pos + 3..].trim();
+
+            // Check if it's macOS format (comma-separated: VENDOR, Model, Version)
+            if rest.contains(',') {
+                let parts: Vec<&str> = rest.splitn(3, ',').collect();
+                if parts.len() >= 2 {
+                    drives.push(CdDrive {
+                        device,
+                        vendor: parts[0].trim().to_string(),
+                        model: parts[1].trim().to_string(),
+                    });
+                }
+            } else {
+                // Linux format (space-separated: Vendor Model)
+                let parts: Vec<&str> = rest.splitn(2, ' ').collect();
+                if parts.len() >= 2 {
+                    drives.push(CdDrive {
+                        device,
+                        vendor: parts[0].to_string(),
+                        model: parts[1].to_string(),
+                    });
+                }
             }
         }
     }
@@ -182,13 +202,28 @@ impl Cdrdao {
         args.push(&toc_str);
 
         let mut cmd = cdrdao_command().ok_or(CdrdaoError::NotInstalled)?;
+
+        // Print command for debugging
+        eprintln!("[cdrdao] Running: cdrdao {}", args.join(" "));
+
         let output = cmd
             .args(&args)
             .output()
             .map_err(|e| CdrdaoError::ExecutionError(e.to_string()))?;
 
+        // Print all output to console for debugging
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let stderr = String::from_utf8_lossy(&output.stderr);
+
+        if !stdout.is_empty() {
+            eprintln!("[cdrdao stdout]\n{}", stdout);
+        }
+        if !stderr.is_empty() {
+            eprintln!("[cdrdao stderr]\n{}", stderr);
+        }
+        eprintln!("[cdrdao] Exit status: {}", output.status);
+
         if !output.status.success() {
-            let stderr = String::from_utf8_lossy(&output.stderr);
             return Err(CdrdaoError::BurnFailed(stderr.to_string()));
         }
 
@@ -272,5 +307,83 @@ mod tests {
             println!("Found cdrdao at: {:?}", found.unwrap());
             assert!(is_available());
         }
+    }
+
+    #[test]
+    fn test_list_drives() {
+        // This test verifies list_drives works (if cdrdao is installed)
+        if !is_available() {
+            return;
+        }
+        match list_drives() {
+            Ok(drives) => {
+                println!("Found {} drives", drives.len());
+                for d in &drives {
+                    println!("  Drive: {} {} ({})", d.vendor, d.model, d.device);
+                }
+            }
+            Err(e) => {
+                println!("Error listing drives: {}", e);
+            }
+        }
+    }
+
+    #[test]
+    fn test_parse_scanbus_macos() {
+        // Test parsing macOS cdrdao scanbus output
+        let macos_output = "IOService:/AppleARMPE/arm-io@10F00000/AppleH16GFamilyIO/usb-drd2@92280000/AppleT8132USBXHCI@02000000/usb-drd2-port-hs@02100000/Pioneer Blu-ray Drive@02100000/IOUSBHostInterface@0/IOUSBMassStorageInterfaceNub/IOUSBMassStorageDriverNub/IOUSBMassStorageDriver/IOSCSILogicalUnitNub@0/IOSCSIPeripheralDeviceType05/IOBDServices : PIONEER, BD-RW   BDR-XD07, 1.03";
+
+        // Simulate parsing logic
+        let mut drives = Vec::new();
+        for line in macos_output.lines() {
+            if let Some(pos) = line.rfind(" : ") {
+                let device = line[..pos].trim().to_string();
+                let rest = line[pos + 3..].trim();
+                if rest.contains(',') {
+                    let parts: Vec<&str> = rest.splitn(3, ',').collect();
+                    if parts.len() >= 2 {
+                        drives.push(CdDrive {
+                            device,
+                            vendor: parts[0].trim().to_string(),
+                            model: parts[1].trim().to_string(),
+                        });
+                    }
+                }
+            }
+        }
+
+        assert_eq!(drives.len(), 1);
+        assert_eq!(drives[0].vendor, "PIONEER");
+        assert_eq!(drives[0].model, "BD-RW   BDR-XD07");
+        assert!(drives[0].device.contains("IOBDServices"));
+    }
+
+    #[test]
+    fn test_parse_scanbus_linux() {
+        // Test parsing Linux cdrdao scanbus output
+        let linux_output = "0,0,0 : SONY, CD-RW  CRX230E, 1.1";
+
+        let mut drives = Vec::new();
+        for line in linux_output.lines() {
+            if let Some(pos) = line.rfind(" : ") {
+                let device = line[..pos].trim().to_string();
+                let rest = line[pos + 3..].trim();
+                if rest.contains(',') {
+                    let parts: Vec<&str> = rest.splitn(3, ',').collect();
+                    if parts.len() >= 2 {
+                        drives.push(CdDrive {
+                            device,
+                            vendor: parts[0].trim().to_string(),
+                            model: parts[1].trim().to_string(),
+                        });
+                    }
+                }
+            }
+        }
+
+        assert_eq!(drives.len(), 1);
+        assert_eq!(drives[0].device, "0,0,0");
+        assert_eq!(drives[0].vendor, "SONY");
+        assert_eq!(drives[0].model, "CD-RW  CRX230E");
     }
 }
