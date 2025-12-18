@@ -812,9 +812,50 @@ fn main() -> Result<(), slint::PlatformError> {
         // TODO: Implement save as dialog
     });
 
-    app.on_remove_track(|_track_num| {
-        println!("Remove track clicked");
-        // TODO: Implement track removal
+    let state_clone = state.clone();
+    let app_weak = app.as_weak();
+    app.on_remove_track(move |track_num| {
+        let removed = {
+            let mut state = state_clone.borrow_mut();
+            if let Some(ref mut project) = state.project {
+                // Find track index by number
+                if let Some(idx) = project.album.tracks.iter().position(|t| t.number == track_num as u8) {
+                    project.album.tracks.remove(idx);
+                    // Renumber remaining tracks
+                    for (i, track) in project.album.tracks.iter_mut().enumerate() {
+                        track.number = (i + 1) as u8;
+                    }
+                    true
+                } else {
+                    false
+                }
+            } else {
+                false
+            }
+        };
+
+        if removed {
+            let state = state_clone.borrow();
+            let tracks = state.tracks_to_model();
+            let new_count = state.project.as_ref().map(|p| p.album.tracks.len()).unwrap_or(0) as i32;
+            drop(state);
+
+            if let Some(app) = app_weak.upgrade() {
+                let model = std::rc::Rc::new(slint::VecModel::from(tracks));
+                app.set_tracks(model.into());
+                // Adjust selection
+                if new_count == 0 {
+                    app.set_selected_track_index(-1);
+                    app.set_current_track_title("".into());
+                    app.set_current_track_pregap("0".into());
+                    app.set_waveform_peaks(std::rc::Rc::new(slint::VecModel::from(Vec::<WaveformPeak>::new())).into());
+                } else if app.get_selected_track_index() >= new_count {
+                    // Select last track if current selection is out of bounds
+                    app.set_selected_track_index(new_count - 1);
+                }
+                app.set_status_message(format!("Removed track {}", track_num).into());
+            }
+        }
     });
 
     let state_clone = state.clone();

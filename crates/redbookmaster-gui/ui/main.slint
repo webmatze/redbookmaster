@@ -202,7 +202,67 @@ export component MainWindow inherits Window {
         floor(seconds / 60) + ":" + (mod(floor(seconds), 60) < 10 ? "0" : "") + floor(mod(seconds, 60))
     }
 
-    VerticalLayout {
+    // Keyboard shortcuts handler
+    FocusScope {
+        key-pressed(event) => {
+            // Space: Play/Pause toggle
+            if (event.text == " ") {
+                if (root.playback.is-playing) {
+                    root.pause();
+                } else {
+                    root.play();
+                }
+                return accept;
+            }
+            // Escape: Stop playback
+            if (event.text == Key.Escape) {
+                root.stop();
+                return accept;
+            }
+            // Up arrow: Select previous track
+            if (event.text == Key.UpArrow) {
+                if (root.selected-track-index > 0) {
+                    root.select-track(root.tracks[root.selected-track-index - 1].number);
+                }
+                return accept;
+            }
+            // Down arrow: Select next track
+            if (event.text == Key.DownArrow) {
+                if (root.selected-track-index < root.tracks.length - 1) {
+                    root.select-track(root.tracks[root.selected-track-index + 1].number);
+                }
+                return accept;
+            }
+            // Delete/Backspace: Remove selected track
+            if (event.text == Key.Delete || event.text == Key.Backspace) {
+                if (root.selected-track-index >= 0) {
+                    root.remove-track(root.tracks[root.selected-track-index].number);
+                }
+                return accept;
+            }
+            // Cmd+N: New project (macOS)
+            if (event.modifiers.meta && event.text == "n") {
+                root.new-project();
+                return accept;
+            }
+            // Cmd+O: Open project (macOS)
+            if (event.modifiers.meta && event.text == "o") {
+                root.open-project();
+                return accept;
+            }
+            // Cmd+S: Save project (macOS)
+            if (event.modifiers.meta && event.text == "s") {
+                if (event.modifiers.shift) {
+                    root.save-project-as();
+                } else {
+                    root.save-project();
+                }
+                return accept;
+            }
+            return reject;
+        }
+
+        VerticalLayout {
         // Menu bar
         Rectangle {
             height: 32px;
@@ -942,5 +1002,6 @@ export component MainWindow inherits Window {
                 }
             }
         }
-    }
+        } // end VerticalLayout
+    } // end FocusScope
 }
