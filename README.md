@@ -5,6 +5,7 @@ A CLI tool for creating Red Book compatible CD masters with CUE sheet output.
 ## Features
 
 - **Interactive wizard** - Guided step-by-step experience for creating CD masters
+- **Native file browser** - Select WAV files using your system's file dialog
 - **Red Book compliant** - Enforces CD-DA specifications (16-bit, 44.1kHz stereo)
 - **Automatic format conversion** - Converts non-compliant WAV files (resampling, bit depth, channels)
 - **Audio preview** - Play tracks, albums, and track transitions before burning
@@ -241,6 +242,7 @@ Red Book Master automatically searches for cdrdao in:
 | hound | WAV file reading and writing |
 | rodio | Audio playback |
 | rubato | High-quality audio resampling |
+| rfd | Native file dialogs |
 | serde / serde_json | Project file serialization |
 | colored | Terminal colors |
 | thiserror | Error handling |

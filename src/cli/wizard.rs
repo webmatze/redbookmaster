@@ -198,6 +198,63 @@ pub fn add_tracks_wizard(project: &mut Project) {
     println!("{}", "─".repeat(40).dimmed());
     println!();
 
+    // Choose input method
+    let method = Select::new(
+        "How would you like to add tracks?",
+        vec![
+            "Browse for files (opens file dialog)",
+            "Enter file paths manually",
+        ],
+    )
+    .prompt();
+
+    match method {
+        Ok("Browse for files (opens file dialog)") => add_tracks_with_browser(project),
+        Ok("Enter file paths manually") => add_tracks_manually(project),
+        _ => return,
+    }
+
+    println!();
+    println!(
+        "Total: {} track(s), duration: {}",
+        project.album.track_count(),
+        project.album.format_duration()
+    );
+}
+
+/// Add tracks using native file browser dialog
+fn add_tracks_with_browser(project: &mut Project) {
+    use rfd::FileDialog;
+
+    println!();
+    println!("Opening file browser... (select one or more WAV files)");
+
+    // Open file dialog for multiple WAV files
+    let files = FileDialog::new()
+        .add_filter("WAV Audio", &["wav", "WAV"])
+        .set_title("Select WAV files to add")
+        .pick_files();
+
+    let files = match files {
+        Some(f) if !f.is_empty() => f,
+        _ => {
+            println!("{} No files selected.", "⚠".yellow());
+            return;
+        }
+    };
+
+    println!();
+    println!("Processing {} file(s)...", files.len());
+    println!();
+
+    for path in files {
+        process_wav_file(project, &path);
+    }
+}
+
+/// Add tracks by entering paths manually
+fn add_tracks_manually(project: &mut Project) {
+    println!();
     println!("Enter paths to WAV files (one per line).");
     println!("Press Enter on an empty line when done.");
     println!();
@@ -227,74 +284,77 @@ pub fn add_tracks_wizard(project: &mut Project) {
             continue;
         }
 
-        // Try to read WAV file info
-        match crate::audio::wav::read_wav_info(&path) {
-            Ok(info) => {
-                // Auto-generate track title from filename
-                let title = path
-                    .file_stem()
-                    .and_then(|s| s.to_str())
-                    .map(|s| clean_track_title(s))
-                    .unwrap_or_else(|| format!("Track {}", project.album.track_count() + 1));
+        process_wav_file(project, &path);
+    }
+}
 
-                let track = crate::core::Track::new(
-                    (project.album.track_count() + 1) as u8,
-                    title.clone(),
-                    path.clone(),
-                    info.duration,
+/// Process a single WAV file and add it to the project
+fn process_wav_file(project: &mut Project, path: &std::path::Path) {
+    // Try to read WAV file info
+    match crate::audio::wav::read_wav_info(path) {
+        Ok(info) => {
+            // Auto-generate track title from filename
+            let title = path
+                .file_stem()
+                .and_then(|s: &std::ffi::OsStr| s.to_str())
+                .map(|s| clean_track_title(s))
+                .unwrap_or_else(|| format!("Track {}", project.album.track_count() + 1));
+
+            let track = crate::core::Track::new(
+                (project.album.track_count() + 1) as u8,
+                title.clone(),
+                path.to_path_buf(),
+                info.duration,
+            );
+
+            // Check format compliance
+            if !info.is_red_book_compliant() {
+                println!(
+                    "{} {} is not Red Book compliant: {}",
+                    "⚠".yellow(),
+                    path.file_name().unwrap_or_default().to_string_lossy(),
+                    info.format_issues().join(", ")
                 );
 
-                // Check format compliance
-                if !info.is_red_book_compliant() {
-                    println!(
-                        "{} File is not Red Book compliant: {}",
-                        "⚠".yellow(),
-                        info.format_issues().join(", ")
-                    );
+                let action = Select::new(
+                    "What would you like to do?",
+                    vec!["Convert automatically", "Skip this file", "Abort"],
+                )
+                .prompt();
 
-                    let action = Select::new(
-                        "What would you like to do?",
-                        vec!["Convert automatically", "Skip this file", "Abort"],
-                    )
-                    .prompt();
-
-                    match action {
-                        Ok("Convert automatically") => {
-                            match convert_and_add_track(project, &path, &title, &info) {
-                                Ok(()) => continue,
-                                Err(e) => {
-                                    println!("{} Conversion failed: {}", "✗".red(), e);
-                                    continue;
-                                }
+                match action {
+                    Ok("Convert automatically") => {
+                        match convert_and_add_track(project, path, &title, &info) {
+                            Ok(()) => {}
+                            Err(e) => {
+                                println!("{} Conversion failed: {}", "✗".red(), e);
                             }
                         }
-                        Ok("Skip this file") => continue,
-                        Ok("Abort") | Err(_) => break,
-                        _ => continue,
                     }
-                } else {
-                    // File is already compliant
-                    project.album.add_track(track);
-                    println!(
-                        "{} Added: {} ({})",
-                        "✓".green(),
-                        title,
-                        crate::core::track::format_duration_ms(info.duration)
-                    );
+                    Ok("Skip this file") => {}
+                    Ok("Abort") | Err(_) => {}
+                    _ => {}
                 }
-            }
-            Err(e) => {
-                println!("{} Failed to read WAV file: {}", "✗".red(), e);
+            } else {
+                // File is already compliant
+                project.album.add_track(track);
+                println!(
+                    "{} Added: {} ({})",
+                    "✓".green(),
+                    title,
+                    crate::core::track::format_duration_ms(info.duration)
+                );
             }
         }
+        Err(e) => {
+            println!(
+                "{} Failed to read {}: {}",
+                "✗".red(),
+                path.file_name().unwrap_or_default().to_string_lossy(),
+                e
+            );
+        }
     }
-
-    println!();
-    println!(
-        "Added {} track(s), total duration: {}",
-        project.album.track_count(),
-        project.album.format_duration()
-    );
 }
 
 /// Clean up a filename to use as track title
