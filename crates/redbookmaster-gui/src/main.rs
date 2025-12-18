@@ -825,6 +825,8 @@ fn main() -> Result<(), slint::PlatformError> {
                     for (i, track) in project.album.tracks.iter_mut().enumerate() {
                         track.number = (i + 1) as u8;
                     }
+                    // Invalidate waveform cache since track numbers changed
+                    state.current_waveform = None;
                     true
                 } else {
                     false
@@ -835,23 +837,63 @@ fn main() -> Result<(), slint::PlatformError> {
         };
 
         if removed {
-            let state = state_clone.borrow();
-            let tracks = state.tracks_to_model();
-            let new_count = state.project.as_ref().map(|p| p.album.tracks.len()).unwrap_or(0) as i32;
-            drop(state);
+            // Gather all UI update data while holding the borrow
+            let (tracks, new_count, track_data, waveform_data) = {
+                let mut state = state_clone.borrow_mut();
+                let tracks = state.tracks_to_model();
+                let new_count = state.project.as_ref().map(|p| p.album.tracks.len()).unwrap_or(0) as i32;
 
+                // Get track metadata for the new selection
+                let track_data = if let Some(app) = app_weak.upgrade() {
+                    let current_idx = app.get_selected_track_index();
+                    let new_idx = if current_idx >= new_count { new_count - 1 } else { current_idx };
+
+                    if new_idx >= 0 {
+                        state.project.as_ref().and_then(|p| {
+                            p.album.tracks.get(new_idx as usize).map(|t| {
+                                (new_idx, t.title.clone(), t.pregap.as_secs(), t.number)
+                            })
+                        })
+                    } else {
+                        None
+                    }
+                } else {
+                    None
+                };
+
+                // Extract waveform if we have a track
+                let waveform_data = if let Some((_, _, _, track_num)) = track_data {
+                    state.extract_waveform(track_num).map(|cache| {
+                        (cache.peaks.clone(), cache.duration_str.clone())
+                    })
+                } else {
+                    None
+                };
+
+                (tracks, new_count, track_data, waveform_data)
+            };
+
+            // Now update UI without holding borrows
             if let Some(app) = app_weak.upgrade() {
                 let model = std::rc::Rc::new(slint::VecModel::from(tracks));
                 app.set_tracks(model.into());
-                // Adjust selection
+
                 if new_count == 0 {
                     app.set_selected_track_index(-1);
                     app.set_current_track_title("".into());
                     app.set_current_track_pregap("0".into());
                     app.set_waveform_peaks(std::rc::Rc::new(slint::VecModel::from(Vec::<WaveformPeak>::new())).into());
-                } else if app.get_selected_track_index() >= new_count {
-                    // Select last track if current selection is out of bounds
-                    app.set_selected_track_index(new_count - 1);
+                    app.set_waveform_duration("0:00".into());
+                } else if let Some((new_idx, title, pregap, _)) = track_data {
+                    app.set_selected_track_index(new_idx);
+                    app.set_current_track_title(title.into());
+                    app.set_current_track_pregap(pregap.to_string().into());
+                    app.set_playhead_position(0.0);
+
+                    if let Some((peaks, duration)) = waveform_data {
+                        app.set_waveform_peaks(std::rc::Rc::new(slint::VecModel::from(peaks)).into());
+                        app.set_waveform_duration(duration.into());
+                    }
                 }
                 app.set_status_message(format!("Removed track {}", track_num).into());
             }
