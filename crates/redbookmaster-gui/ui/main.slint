@@ -331,7 +331,6 @@ export component MainWindow inherits Window {
                 padding-left: 8px;
                 padding-right: 8px;
                 spacing: 4px;
-                alignment: start;
 
                 // Quick action buttons
                 new-btn := Rectangle {
@@ -440,6 +439,20 @@ export component MainWindow inherits Window {
                         horizontal-alignment: center;
                         vertical-alignment: center;
                     }
+                }
+
+                // Spacer to push branding to the right
+                Rectangle {
+                    horizontal-stretch: 1;
+                }
+
+                // App branding
+                Text {
+                    text: "Red Book Master";
+                    color: Theme.text-secondary;
+                    font-size: 18px;
+                    font-weight: 600;
+                    vertical-alignment: center;
                 }
             }
         }
