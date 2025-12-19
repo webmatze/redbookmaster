@@ -8,7 +8,7 @@ use std::cell::RefCell;
 use std::path::PathBuf;
 use std::sync::Arc;
 
-use redbookmaster_lib::{Album, Project, Track, extract_peaks};
+use redbookmaster_lib::{Album, Project, Track, extract_peaks, WaveformData};
 use redbookmaster_lib::core::track::format_duration_ms;
 use redbookmaster_lib::audio::concat::concatenate_tracks;
 use redbookmaster_lib::{generate_cue, generate_toc};
@@ -29,12 +29,17 @@ struct AppState {
     current_waveform: Option<WaveformCache>,
     current_track_path: Option<PathBuf>,
     current_track_num: Option<u8>,
+    /// Current zoom level (1.0 = full view, 2.0 = 2x zoom, etc.)
+    zoom_level: f32,
+    /// Scroll offset for zoomed view (0.0 to 1.0 - zoom_range)
+    scroll_offset: f32,
 }
 
 /// Cached waveform data
 struct WaveformCache {
     track_number: u8,
-    peaks: Vec<WaveformPeak>,
+    /// Full waveform data for zooming
+    waveform_data: WaveformData,
     duration_str: String,
 }
 
@@ -46,6 +51,8 @@ impl AppState {
             current_waveform: None,
             current_track_path: None,
             current_track_num: None,
+            zoom_level: 1.0,
+            scroll_offset: 0.0,
         }
     }
 
@@ -57,6 +64,8 @@ impl AppState {
         self.current_waveform = None;
         self.current_track_path = None;
         self.current_track_num = None;
+        self.zoom_level = 1.0;
+        self.scroll_offset = 0.0;
     }
 
     fn tracks_to_model(&self) -> Vec<TrackData> {
@@ -94,7 +103,7 @@ impl AppState {
         self.project.as_ref()?.album.get_track(track_num)
     }
 
-    /// Extract waveform for a track
+    /// Extract waveform for a track (stores full data for zooming)
     fn extract_waveform(&mut self, track_num: u8) -> Option<&WaveformCache> {
         // Check if we already have this waveform cached
         if let Some(ref cache) = self.current_waveform {
@@ -108,16 +117,17 @@ impl AppState {
         let path = &track.source_file;
         let duration = track.duration;
 
-        // Extract peaks
-        match extract_peaks(path, WAVEFORM_BINS) {
+        // Extract more peaks than needed to allow zooming (16x max zoom)
+        const FULL_PEAKS: usize = WAVEFORM_BINS * 16;
+        match extract_peaks(path, FULL_PEAKS) {
             Ok(waveform_data) => {
-                let peaks: Vec<WaveformPeak> = waveform_data.peaks.iter().map(|&(min, max)| {
-                    WaveformPeak { min, max }
-                }).collect();
+                // Reset zoom when loading new track
+                self.zoom_level = 1.0;
+                self.scroll_offset = 0.0;
 
                 self.current_waveform = Some(WaveformCache {
                     track_number: track_num,
-                    peaks,
+                    waveform_data,
                     duration_str: format_duration_ms(duration),
                 });
 
@@ -128,6 +138,22 @@ impl AppState {
                 None
             }
         }
+    }
+
+    /// Get peaks for current zoom level and scroll offset
+    fn get_visible_peaks(&self) -> Vec<WaveformPeak> {
+        let Some(ref cache) = self.current_waveform else {
+            return Vec::new();
+        };
+
+        // Calculate visible range based on zoom and scroll
+        let view_size = 1.0 / self.zoom_level;
+        let start = self.scroll_offset;
+        let end = (start + view_size).min(1.0);
+
+        // Get peaks for the visible range
+        let peaks = cache.waveform_data.get_peaks_for_range(start, end, WAVEFORM_BINS);
+        peaks.iter().map(|&(min, max)| WaveformPeak { min, max }).collect()
     }
 }
 
@@ -336,11 +362,11 @@ fn main() -> Result<(), slint::PlatformError> {
         }
 
         // Extract waveform
-        if let Some(cache) = state.extract_waveform(track_num as u8) {
-            if let Some(app) = app_weak.upgrade() {
-                let peaks = cache.peaks.clone();
-                let duration = cache.duration_str.clone();
+        if state.extract_waveform(track_num as u8).is_some() {
+            let peaks = state.get_visible_peaks();
+            let duration = state.current_waveform.as_ref().map(|c| c.duration_str.clone()).unwrap_or_default();
 
+            if let Some(app) = app_weak.upgrade() {
                 let model = Rc::new(slint::VecModel::from(peaks));
                 app.set_waveform_peaks(model.into());
                 app.set_waveform_duration(duration.into());
@@ -432,9 +458,9 @@ fn main() -> Result<(), slint::PlatformError> {
                     }
 
                     // Extract waveform
-                    if let Some(cache) = state.extract_waveform(track_num) {
-                        let peaks = cache.peaks.clone();
-                        let duration = cache.duration_str.clone();
+                    if state.extract_waveform(track_num).is_some() {
+                        let peaks = state.get_visible_peaks();
+                        let duration = state.current_waveform.as_ref().map(|c| c.duration_str.clone()).unwrap_or_default();
 
                         let model = Rc::new(slint::VecModel::from(peaks));
                         app.set_waveform_peaks(model.into());
@@ -505,12 +531,92 @@ fn main() -> Result<(), slint::PlatformError> {
         }
     });
 
-    app.on_zoom_in(|| {
-        println!("Zoom in");
+    let state_clone = state.clone();
+    let app_weak = app.as_weak();
+    app.on_zoom_in(move || {
+        let mut state = state_clone.borrow_mut();
+        if state.current_waveform.is_none() {
+            return;
+        }
+
+        // Zoom in (max 16x)
+        let old_zoom = state.zoom_level;
+        state.zoom_level = (state.zoom_level * 2.0).min(16.0);
+
+        // Adjust scroll to keep center in view
+        let old_view_size = 1.0 / old_zoom;
+        let new_view_size = 1.0 / state.zoom_level;
+        let center = state.scroll_offset + old_view_size / 2.0;
+        state.scroll_offset = (center - new_view_size / 2.0).max(0.0).min(1.0 - new_view_size);
+
+        // Get updated peaks for new zoom level
+        let peaks = state.get_visible_peaks();
+        let zoom_level = state.zoom_level;
+        let scroll_offset = state.scroll_offset;
+
+        if let Some(app) = app_weak.upgrade() {
+            let model = Rc::new(slint::VecModel::from(peaks));
+            app.set_waveform_peaks(model.into());
+            app.set_zoom_level(zoom_level);
+            app.set_waveform_scroll_offset(scroll_offset);
+        }
     });
 
-    app.on_zoom_out(|| {
-        println!("Zoom out");
+    let state_clone = state.clone();
+    let app_weak = app.as_weak();
+    app.on_zoom_out(move || {
+        let mut state = state_clone.borrow_mut();
+        if state.current_waveform.is_none() {
+            return;
+        }
+
+        // Zoom out (min 1x)
+        let old_zoom = state.zoom_level;
+        state.zoom_level = (state.zoom_level / 2.0).max(1.0);
+
+        // Adjust scroll to keep center in view
+        let old_view_size = 1.0 / old_zoom;
+        let new_view_size = 1.0 / state.zoom_level;
+        let center = state.scroll_offset + old_view_size / 2.0;
+        state.scroll_offset = (center - new_view_size / 2.0).max(0.0).min(1.0 - new_view_size);
+
+        // Get updated peaks for new zoom level
+        let peaks = state.get_visible_peaks();
+        let zoom_level = state.zoom_level;
+        let scroll_offset = state.scroll_offset;
+
+        if let Some(app) = app_weak.upgrade() {
+            let model = Rc::new(slint::VecModel::from(peaks));
+            app.set_waveform_peaks(model.into());
+            app.set_zoom_level(zoom_level);
+            app.set_waveform_scroll_offset(scroll_offset);
+        }
+    });
+
+    let state_clone = state.clone();
+    let app_weak = app.as_weak();
+    app.on_waveform_scroll(move |delta| {
+        let mut state = state_clone.borrow_mut();
+        if state.current_waveform.is_none() || state.zoom_level <= 1.0 {
+            return; // No scrolling at 1x zoom
+        }
+
+        // Calculate view size and max scroll
+        let view_size = 1.0 / state.zoom_level;
+        let max_scroll = 1.0 - view_size;
+
+        // Update scroll offset
+        state.scroll_offset = (state.scroll_offset + delta * 0.1).max(0.0).min(max_scroll);
+
+        // Get updated peaks for new scroll position
+        let peaks = state.get_visible_peaks();
+        let scroll_offset = state.scroll_offset;
+
+        if let Some(app) = app_weak.upgrade() {
+            let model = Rc::new(slint::VecModel::from(peaks));
+            app.set_waveform_peaks(model.into());
+            app.set_waveform_scroll_offset(scroll_offset);
+        }
     });
 
     let state_clone = state.clone();
@@ -909,9 +1015,13 @@ fn main() -> Result<(), slint::PlatformError> {
 
                 // Extract waveform if we have a track
                 let waveform_data = if let Some((_, _, _, track_num)) = track_data {
-                    state.extract_waveform(track_num).map(|cache| {
-                        (cache.peaks.clone(), cache.duration_str.clone())
-                    })
+                    if state.extract_waveform(track_num).is_some() {
+                        let peaks = state.get_visible_peaks();
+                        let duration = state.current_waveform.as_ref().map(|c| c.duration_str.clone()).unwrap_or_default();
+                        Some((peaks, duration))
+                    } else {
+                        None
+                    }
                 } else {
                     None
                 };
@@ -1020,9 +1130,13 @@ fn main() -> Result<(), slint::PlatformError> {
         // Second pass: extract waveform (needs separate borrow)
         let waveform_data = if let Some((_, _, track_num)) = track_metadata {
             let mut state = state_clone.borrow_mut();
-            state.extract_waveform(track_num).map(|cache| {
-                (cache.peaks.clone(), cache.duration_str.clone())
-            })
+            if state.extract_waveform(track_num).is_some() {
+                let peaks = state.get_visible_peaks();
+                let duration = state.current_waveform.as_ref().map(|c| c.duration_str.clone()).unwrap_or_default();
+                Some((peaks, duration))
+            } else {
+                None
+            }
         } else {
             None
         };
@@ -1119,9 +1233,9 @@ fn main() -> Result<(), slint::PlatformError> {
                                 }
 
                                 // Extract waveform
-                                if let Some(cache) = state.extract_waveform(track_num) {
-                                    let peaks = cache.peaks.clone();
-                                    let duration = cache.duration_str.clone();
+                                if state.extract_waveform(track_num).is_some() {
+                                    let peaks = state.get_visible_peaks();
+                                    let duration = state.current_waveform.as_ref().map(|c| c.duration_str.clone()).unwrap_or_default();
 
                                     let model = Rc::new(slint::VecModel::from(peaks));
                                     app.set_waveform_peaks(model.into());

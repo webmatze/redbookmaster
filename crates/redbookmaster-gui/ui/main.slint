@@ -67,6 +67,7 @@ component WaveformView inherits Rectangle {
     in property <bool> is-playing: false;
 
     callback seek(float);
+    callback scroll(float);  // scroll delta
 
     background: Theme.input-background;
     border-radius: 4px;
@@ -103,9 +104,14 @@ component WaveformView inherits Rectangle {
         }
     }
 
-    // Playhead - always visible when we have peaks
-    if root.peaks.length > 0: Rectangle {
-        x: max(0px, min(parent.width - 2px, root.playhead-position * parent.width - 1px));
+    // Playhead - calculate visual position based on zoom and scroll
+    // visual-pos = (absolute-pos - scroll-offset) * zoom
+    property <float> view-size: 1.0 / root.zoom;
+    property <float> visual-playhead: (root.playhead-position - root.scroll-offset) * root.zoom;
+    property <bool> playhead-visible: root.peaks.length > 0 && visual-playhead >= 0.0 && visual-playhead <= 1.0;
+
+    if playhead-visible: Rectangle {
+        x: max(0px, min(parent.width - 2px, visual-playhead * parent.width - 1px));
         y: 0;
         width: 2px;
         height: parent.height;
@@ -122,16 +128,30 @@ component WaveformView inherits Rectangle {
         }
     }
 
-    // Click to seek
+    // Click to seek and scroll to pan
     TouchArea {
         clicked => {
-            root.playhead-position = max(0.0, min(1.0, self.mouse-x / parent.width));
+            // Convert click position to absolute track position
+            // absolute = scroll-offset + (click-relative * view-size)
+            root.playhead-position = max(0.0, min(1.0, root.scroll-offset + (self.mouse-x / parent.width) * root.view-size));
             root.seek(root.playhead-position);
         }
         moved => {
             if self.pressed {
-                root.playhead-position = max(0.0, min(1.0, self.mouse-x / parent.width));
+                root.playhead-position = max(0.0, min(1.0, root.scroll-offset + (self.mouse-x / parent.width) * root.view-size));
             }
+        }
+        scroll-event(e) => {
+            // Horizontal scroll to pan (use delta-x, or delta-y with shift)
+            if e.delta-x != 0 {
+                root.scroll(e.delta-x / 100px);
+                return accept;
+            } else if e.delta-y != 0 {
+                // Use vertical scroll for horizontal panning
+                root.scroll(-e.delta-y / 100px);
+                return accept;
+            }
+            return reject;
         }
     }
 
@@ -178,6 +198,7 @@ export component MainWindow inherits Window {
     callback waveform-seek(float);
     callback zoom-in();
     callback zoom-out();
+    callback waveform-scroll(float);  // scroll delta (-1.0 to 1.0)
     callback reorder-tracks(int, int);  // from-index, to-index
 
     // Properties bound to Rust
@@ -197,7 +218,8 @@ export component MainWindow inherits Window {
 
     // Internal state
     property <int> hover-track: -1;
-    property <float> zoom-level: 1.0;
+    in property <float> zoom-level: 1.0;
+    in property <float> waveform-scroll-offset: 0.0;
 
     // Drag-and-drop state for track reordering
     property <int> dragging-track-index: -1;
@@ -705,7 +727,6 @@ export component MainWindow inherits Window {
 
                                     zoom-out-touch := TouchArea {
                                         clicked => {
-                                            root.zoom-level = max(1.0, root.zoom-level / 2.0);
                                             root.zoom-out();
                                         }
                                     }
@@ -736,7 +757,6 @@ export component MainWindow inherits Window {
 
                                     zoom-in-touch := TouchArea {
                                         clicked => {
-                                            root.zoom-level = min(16.0, root.zoom-level * 2.0);
                                             root.zoom-in();
                                         }
                                     }
@@ -787,9 +807,13 @@ export component MainWindow inherits Window {
                             playhead-position <=> root.playhead-position;
                             is-playing: root.playback.is-playing;
                             zoom: root.zoom-level;
+                            scroll-offset: root.waveform-scroll-offset;
 
                             seek(pos) => {
                                 root.waveform-seek(pos);
+                            }
+                            scroll(delta) => {
+                                root.waveform-scroll(delta);
                             }
                         }
                     }
