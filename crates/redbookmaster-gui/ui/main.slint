@@ -824,10 +824,15 @@ export component MainWindow inherits Window {
                     border-width: 1px;
                     border-color: Theme.panel-border;
 
-                    HorizontalLayout {
-                        padding: 16px;
-                        spacing: 16px;
+                    VerticalLayout {
                         alignment: center;
+                        padding-left: 16px;
+                        padding-right: 16px;
+
+                        HorizontalLayout {
+                            height: 48px;
+                            spacing: 16px;
+                            alignment: center;
 
                         // Play/Pause button
                         Rectangle {
@@ -862,26 +867,29 @@ export component MainWindow inherits Window {
                         }
 
                         // Stop button
-                        Rectangle {
-                            property <bool> enabled: root.tracks.length > 0;
-
-                            width: 36px;
-                            height: 36px;
-                            border-radius: 4px;
-                            background: stop-touch.has-hover && enabled ? Theme.button-hover : Theme.button-background;
-                            opacity: enabled ? 1.0 : 0.5;
-
-                            stop-touch := TouchArea {
-                                enabled: parent.enabled;
-                                clicked => { root.stop(); }
-                            }
-
+                        VerticalLayout {
+                            alignment: center;
                             Rectangle {
-                                x: 10px;
-                                y: 10px;
-                                width: 16px;
-                                height: 16px;
-                                background: Theme.text-primary;
+                                property <bool> enabled: root.tracks.length > 0;
+
+                                width: 36px;
+                                height: 36px;
+                                border-radius: 4px;
+                                background: stop-touch.has-hover && enabled ? Theme.button-hover : Theme.button-background;
+                                opacity: enabled ? 1.0 : 0.5;
+
+                                stop-touch := TouchArea {
+                                    enabled: parent.enabled;
+                                    clicked => { root.stop(); }
+                                }
+
+                                Rectangle {
+                                    x: 10px;
+                                    y: 10px;
+                                    width: 16px;
+                                    height: 16px;
+                                    background: Theme.text-primary;
+                                }
                             }
                         }
 
@@ -917,57 +925,60 @@ export component MainWindow inherits Window {
                         }
 
                         // Volume control
-                        HorizontalLayout {
-                            spacing: 8px;
+                        VerticalLayout {
                             alignment: center;
+                            HorizontalLayout {
+                                spacing: 8px;
 
-                            Text {
-                                text: "Vol";
-                                color: Theme.text-secondary;
-                                font-size: 12px;
-                                vertical-alignment: center;
-                            }
+                                Text {
+                                    text: "Vol";
+                                    color: Theme.text-secondary;
+                                    font-size: 12px;
+                                    vertical-alignment: center;
+                                }
 
-                            Rectangle {
-                                width: 80px;
-                                height: 6px;
-                                background: Theme.input-background;
-                                border-radius: 3px;
+                                Rectangle {
+                                    width: 80px;
+                                    height: 6px;
+                                    background: Theme.input-background;
+                                    border-radius: 3px;
 
-                                vol-touch := TouchArea {
-                                    clicked => {
-                                        root.set-volume(max(0.0, min(1.0, self.mouse-x / parent.width)));
-                                    }
-                                    moved => {
-                                        if self.pressed {
+                                    vol-touch := TouchArea {
+                                        clicked => {
                                             root.set-volume(max(0.0, min(1.0, self.mouse-x / parent.width)));
                                         }
+                                        moved => {
+                                            if self.pressed {
+                                                root.set-volume(max(0.0, min(1.0, self.mouse-x / parent.width)));
+                                            }
+                                        }
                                     }
-                                }
 
-                                // Volume fill bar
-                                Rectangle {
-                                    x: 0;
-                                    y: 0;
-                                    width: parent.width * root.playback.volume;
-                                    height: parent.height;
-                                    background: Theme.accent;
-                                    border-radius: 3px;
-                                }
+                                    // Volume fill bar
+                                    Rectangle {
+                                        x: 0;
+                                        y: 0;
+                                        width: parent.width * root.playback.volume;
+                                        height: parent.height;
+                                        background: Theme.accent;
+                                        border-radius: 3px;
+                                    }
 
-                                // Draggable handle
-                                Rectangle {
-                                    x: parent.width * root.playback.volume - 6px;
-                                    y: -3px;
-                                    width: 12px;
-                                    height: 12px;
-                                    border-radius: 6px;
-                                    background: Theme.accent;
-                                    border-width: 2px;
-                                    border-color: Theme.text-primary;
+                                    // Draggable handle
+                                    Rectangle {
+                                        x: parent.width * root.playback.volume - 6px;
+                                        y: -3px;
+                                        width: 12px;
+                                        height: 12px;
+                                        border-radius: 6px;
+                                        background: Theme.accent;
+                                        border-width: 2px;
+                                        border-color: Theme.text-primary;
+                                    }
                                 }
                             }
                         }
+                    }
                     }
                 }
             }
