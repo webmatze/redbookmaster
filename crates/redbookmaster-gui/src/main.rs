@@ -5,8 +5,10 @@ mod player;
 
 use std::rc::Rc;
 use std::cell::RefCell;
+use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use redbookmaster_lib::{Album, Project, Track, extract_peaks, WaveformData};
 use redbookmaster_lib::core::track::format_duration_ms;
@@ -28,7 +30,10 @@ const WAVEFORM_BINS: usize = 500;
 struct AppState {
     project: Option<Project>,
     project_path: Option<PathBuf>,
-    current_waveform: Option<WaveformCache>,
+    /// Multi-track waveform cache (track_number -> cache)
+    waveform_cache: HashMap<u8, WaveformCache>,
+    /// Currently displayed track number
+    displayed_track_num: Option<u8>,
     current_track_path: Option<PathBuf>,
     current_track_num: Option<u8>,
     /// Current zoom level (1.0 = full view, 2.0 = 2x zoom, etc.)
@@ -41,7 +46,6 @@ struct AppState {
 
 /// Cached waveform data
 struct WaveformCache {
-    track_number: u8,
     /// Full waveform data for zooming
     waveform_data: WaveformData,
     duration_str: String,
@@ -52,7 +56,8 @@ impl AppState {
         Self {
             project: None,
             project_path: None,
-            current_waveform: None,
+            waveform_cache: HashMap::new(),
+            displayed_track_num: None,
             current_track_path: None,
             current_track_num: None,
             zoom_level: 1.0,
@@ -66,7 +71,8 @@ impl AppState {
         let project = Project::new(album);
         self.project = Some(project);
         self.project_path = None;
-        self.current_waveform = None;
+        self.waveform_cache.clear();
+        self.displayed_track_num = None;
         self.current_track_path = None;
         self.current_track_num = None;
         self.zoom_level = 1.0;
@@ -109,45 +115,42 @@ impl AppState {
     }
 
     /// Extract waveform for a track (stores full data for zooming)
-    fn extract_waveform(&mut self, track_num: u8) -> Option<&WaveformCache> {
-        // Check if we already have this waveform cached
-        if let Some(ref cache) = self.current_waveform {
-            if cache.track_number == track_num {
-                return self.current_waveform.as_ref();
-            }
-        }
-
-        // Get the track
-        let track = self.get_track(track_num)?;
-        let path = &track.source_file;
-        let duration = track.duration;
-
-        // Extract more peaks than needed to allow zooming (16x max zoom)
-        const FULL_PEAKS: usize = WAVEFORM_BINS * 16;
-        match extract_peaks(path, FULL_PEAKS) {
-            Ok(waveform_data) => {
-                // Reset zoom when loading new track
-                self.zoom_level = 1.0;
-                self.scroll_offset = 0.0;
-
-                self.current_waveform = Some(WaveformCache {
-                    track_number: track_num,
-                    waveform_data,
-                    duration_str: format_duration_ms(duration),
-                });
-
-                self.current_waveform.as_ref()
-            }
-            Err(e) => {
-                eprintln!("Failed to extract waveform: {}", e);
-                None
-            }
-        }
+    /// Get cached waveform for a track, or None if not cached
+    fn get_cached_waveform(&self, track_num: u8) -> Option<&WaveformCache> {
+        self.waveform_cache.get(&track_num)
     }
 
-    /// Get peaks for current zoom level and scroll offset
+    /// Insert waveform into cache
+    fn insert_waveform(&mut self, track_num: u8, waveform_data: WaveformData, duration_str: String) {
+        self.waveform_cache.insert(track_num, WaveformCache {
+            waveform_data,
+            duration_str,
+        });
+    }
+
+    /// Get peaks for current zoom level and scroll offset for the displayed track
     fn get_visible_peaks(&self) -> Vec<WaveformPeak> {
-        let Some(ref cache) = self.current_waveform else {
+        let Some(track_num) = self.displayed_track_num else {
+            return Vec::new();
+        };
+
+        let Some(cache) = self.waveform_cache.get(&track_num) else {
+            return Vec::new();
+        };
+
+        // Calculate visible range based on zoom and scroll
+        let view_size = 1.0 / self.zoom_level;
+        let start = self.scroll_offset;
+        let end = (start + view_size).min(1.0);
+
+        // Get peaks for the visible range
+        let peaks = cache.waveform_data.get_peaks_for_range(start, end, WAVEFORM_BINS);
+        peaks.iter().map(|&(min, max)| WaveformPeak { min, max }).collect()
+    }
+
+    /// Get visible peaks for a specific track from cache
+    fn get_visible_peaks_for_track(&self, track_num: u8) -> Vec<WaveformPeak> {
+        let Some(cache) = self.waveform_cache.get(&track_num) else {
             return Vec::new();
         };
 
@@ -211,7 +214,8 @@ fn main() -> Result<(), slint::PlatformError> {
                     let mut state = state_clone.borrow_mut();
                     state.project = Some(project);
                     state.project_path = Some(path.clone());
-                    state.current_waveform = None;
+                    state.waveform_cache.clear();
+                    state.displayed_track_num = None;
 
                     if let Some(app) = app_weak.upgrade() {
                         let tracks: Vec<TrackData> = state.tracks_to_model();
@@ -372,12 +376,26 @@ fn main() -> Result<(), slint::PlatformError> {
         }
     });
 
-    // Track selection with waveform extraction
+    // Shared containers for async waveform loading (thread-safe)
+    // Stores the pending request: (track_num, path, duration)
+    let waveform_pending: Arc<std::sync::Mutex<Option<(u8, PathBuf, std::time::Duration)>>> =
+        Arc::new(std::sync::Mutex::new(None));
+    // Stores the result: (track_num, waveform_data, duration_str)
+    let waveform_result: Arc<std::sync::Mutex<Option<(u8, WaveformData, String)>>> =
+        Arc::new(std::sync::Mutex::new(None));
+    // Flag indicating if a worker thread is currently running
+    let waveform_worker_active: Arc<AtomicBool> = Arc::new(AtomicBool::new(false));
+
+    // Track selection with async waveform loading
     let app_weak = app.as_weak();
     let state_clone = state.clone();
     let engine_clone = audio_engine.clone();
+    let wf_pending = waveform_pending.clone();
+    let wf_result = waveform_result.clone();
+    let wf_worker_active = waveform_worker_active.clone();
     app.on_select_track(move |track_num| {
         let mut state = state_clone.borrow_mut();
+        let track_num_u8 = track_num as u8;
 
         if let Some(app) = app_weak.upgrade() {
             // Find the track index and update metadata editor
@@ -394,10 +412,6 @@ fn main() -> Result<(), slint::PlatformError> {
                     }
                 }
             }
-
-            // Show loading state
-            app.set_waveform_loading(true);
-            app.set_status_message(format!("Loading waveform for track {}...", track_num).into());
         }
 
         // Check if we were playing before switching tracks
@@ -408,40 +422,126 @@ fn main() -> Result<(), slint::PlatformError> {
             false
         };
 
-        // Get track path for audio playback
-        if let Some(track) = state.get_track(track_num as u8) {
+        // Get track info for audio playback and async waveform loading
+        let track_info = if let Some(track) = state.get_track(track_num_u8) {
             let path = track.source_file.clone();
+            let duration = track.duration;
             state.current_track_path = Some(path.clone());
-            state.current_track_num = Some(track_num as u8);
+            state.current_track_num = Some(track_num_u8);
+            Some((path, duration))
+        } else {
+            None
+        };
 
-            // Load track into audio engine, and play immediately if we were already playing
+        // Load track into audio engine
+        if let Some((ref path, _)) = track_info {
             if was_playing {
-                engine_clone.load_and_play(path);
+                engine_clone.load_and_play(path.clone());
             } else {
-                engine_clone.load(path);
+                engine_clone.load(path.clone());
             }
         }
 
-        // Extract waveform
-        if state.extract_waveform(track_num as u8).is_some() {
-            let peaks = state.get_visible_peaks();
-            let duration = state.current_waveform.as_ref().map(|c| c.duration_str.clone()).unwrap_or_default();
+        // Update displayed track number
+        state.displayed_track_num = Some(track_num_u8);
+
+        // Reset zoom when switching tracks
+        state.zoom_level = 1.0;
+        state.scroll_offset = 0.0;
+
+        // Check if waveform is already cached
+        if state.get_cached_waveform(track_num_u8).is_some() {
+            // Cache hit - update UI immediately
+            let peaks = state.get_visible_peaks_for_track(track_num_u8);
+            let duration = state.waveform_cache.get(&track_num_u8)
+                .map(|c| c.duration_str.clone())
+                .unwrap_or_default();
+
+            drop(state); // Release borrow before UI updates
 
             if let Some(app) = app_weak.upgrade() {
                 let model = Rc::new(slint::VecModel::from(peaks));
                 app.set_waveform_peaks(model.into());
                 app.set_waveform_duration(duration.into());
                 app.set_waveform_loading(false);
+                app.set_zoom_level(1.0);
+                app.set_waveform_scroll_offset(0.0);
                 app.set_status_message(format!("Track {} selected", track_num).into());
-
-                // Reset playhead position
                 app.set_playhead_position(0.0);
             }
-        } else {
-            if let Some(app) = app_weak.upgrade() {
-                app.set_waveform_loading(false);
-                app.set_status_message("Failed to load waveform".into());
-            }
+            return;
+        }
+
+        // Cache miss - start async loading
+        if let Some(app) = app_weak.upgrade() {
+            app.set_waveform_loading(true);
+            app.set_zoom_level(1.0);
+            app.set_waveform_scroll_offset(0.0);
+            app.set_status_message(format!("Loading waveform for track {}...", track_num).into());
+            app.set_playhead_position(0.0);
+            // Clear waveform display while loading
+            app.set_waveform_peaks(Rc::new(slint::VecModel::from(Vec::<WaveformPeak>::new())).into());
+        }
+
+        // Get track info for background thread
+        let Some((track_path, track_duration)) = track_info else {
+            return;
+        };
+
+        // Store the pending request (this cancels any previous request)
+        if let Ok(mut pending) = wf_pending.lock() {
+            *pending = Some((track_num_u8, track_path.clone(), track_duration));
+        }
+
+        // Only spawn a new worker thread if one isn't already running
+        if !wf_worker_active.swap(true, Ordering::SeqCst) {
+            let pending_clone = wf_pending.clone();
+            let result_clone = wf_result.clone();
+            let worker_active_clone = wf_worker_active.clone();
+
+            std::thread::spawn(move || {
+                loop {
+                    // Get the pending request
+                    let request = {
+                        let mut pending = pending_clone.lock().unwrap();
+                        pending.take()
+                    };
+
+                    let Some((track_num, track_path, track_duration)) = request else {
+                        break; // No more requests
+                    };
+
+                    // Extract waveform (this is the slow part)
+                    const FULL_PEAKS: usize = WAVEFORM_BINS * 16;
+                    if let Ok(waveform_data) = extract_peaks(&track_path, FULL_PEAKS) {
+                        let duration_str = format_duration_ms(track_duration);
+
+                        // Check if there's a newer request - if so, discard this result
+                        let has_newer_request = {
+                            let pending = pending_clone.lock().unwrap();
+                            pending.is_some()
+                        };
+
+                        if !has_newer_request {
+                            // Store the result
+                            if let Ok(mut result) = result_clone.lock() {
+                                *result = Some((track_num, waveform_data, duration_str));
+                            }
+                        }
+                    }
+
+                    // Check if there's another request pending
+                    let has_pending = {
+                        let pending = pending_clone.lock().unwrap();
+                        pending.is_some()
+                    };
+
+                    if !has_pending {
+                        break;
+                    }
+                }
+                worker_active_clone.store(false, Ordering::SeqCst);
+            });
         }
     });
 
@@ -488,7 +588,6 @@ fn main() -> Result<(), slint::PlatformError> {
     // Playback callbacks
     let engine_clone = audio_engine.clone();
     let app_weak = app.as_weak();
-    let state_clone = state.clone();
     app.on_play(move || {
         if let Some(app) = app_weak.upgrade() {
             let tracks = app.get_tracks();
@@ -501,39 +600,10 @@ fn main() -> Result<(), slint::PlatformError> {
             // Auto-select first track if none is selected
             let selected_index = app.get_selected_track_index();
             if selected_index < 0 {
-                // Select the first track
+                // Select the first track (this will trigger on_select_track callback
+                // which handles waveform loading asynchronously)
                 if let Some(first_track) = tracks.row_data(0) {
-                    let track_num = first_track.number as u8;
-
-                    // Update metadata editor fields
-                    app.set_current_track_title(first_track.title.clone());
-                    app.set_current_track_pregap(first_track.pregap.clone());
-
-                    // Get track path and load into engine
-                    let mut state = state_clone.borrow_mut();
-                    if let Some(track) = state.get_track(track_num) {
-                        let path = track.source_file.clone();
-                        state.current_track_path = Some(path.clone());
-                        state.current_track_num = Some(track_num);
-                        engine_clone.load(path);
-                    }
-
-                    // Extract waveform
-                    if state.extract_waveform(track_num).is_some() {
-                        let peaks = state.get_visible_peaks();
-                        let duration = state.current_waveform.as_ref().map(|c| c.duration_str.clone()).unwrap_or_default();
-
-                        let model = Rc::new(slint::VecModel::from(peaks));
-                        app.set_waveform_peaks(model.into());
-                        app.set_waveform_duration(duration.into());
-                    }
-
-                    app.set_selected_track_index(0);
-                    app.set_playhead_position(0.0);
-                    drop(state);
-
-                    // Small delay to allow track to load before playing
-                    // The audio engine will handle the play command once loaded
+                    app.invoke_select_track(first_track.number);
                 }
             }
 
@@ -631,7 +701,10 @@ fn main() -> Result<(), slint::PlatformError> {
     let app_weak = app.as_weak();
     app.on_zoom_in(move || {
         let mut state = state_clone.borrow_mut();
-        if state.current_waveform.is_none() {
+        let Some(track_num) = state.displayed_track_num else {
+            return;
+        };
+        if state.waveform_cache.get(&track_num).is_none() {
             return;
         }
 
@@ -662,7 +735,10 @@ fn main() -> Result<(), slint::PlatformError> {
     let app_weak = app.as_weak();
     app.on_zoom_out(move || {
         let mut state = state_clone.borrow_mut();
-        if state.current_waveform.is_none() {
+        let Some(track_num) = state.displayed_track_num else {
+            return;
+        };
+        if state.waveform_cache.get(&track_num).is_none() {
             return;
         }
 
@@ -693,7 +769,10 @@ fn main() -> Result<(), slint::PlatformError> {
     let app_weak = app.as_weak();
     app.on_waveform_scroll(move |delta| {
         let mut state = state_clone.borrow_mut();
-        if state.current_waveform.is_none() || state.zoom_level <= 1.0 {
+        let Some(track_num) = state.displayed_track_num else {
+            return;
+        };
+        if state.waveform_cache.get(&track_num).is_none() || state.zoom_level <= 1.0 {
             return; // No scrolling at 1x zoom
         }
 
@@ -1074,7 +1153,8 @@ fn main() -> Result<(), slint::PlatformError> {
                         track.number = (i + 1) as u8;
                     }
                     // Invalidate waveform cache since track numbers changed
-                    state.current_waveform = None;
+                    state.waveform_cache.clear();
+                    state.displayed_track_num = None;
                     true
                 } else {
                     false
@@ -1086,21 +1166,19 @@ fn main() -> Result<(), slint::PlatformError> {
 
         if removed {
             // Gather all UI update data while holding the borrow
-            let (tracks, new_count, track_data, waveform_data) = {
-                let mut state = state_clone.borrow_mut();
+            let (tracks, new_count, new_track_num) = {
+                let state = state_clone.borrow();
                 let tracks = state.tracks_to_model();
                 let new_count = state.project.as_ref().map(|p| p.album.tracks.len()).unwrap_or(0) as i32;
 
-                // Get track metadata for the new selection
-                let track_data = if let Some(app) = app_weak.upgrade() {
+                // Get track number for the new selection
+                let new_track_num = if let Some(app) = app_weak.upgrade() {
                     let current_idx = app.get_selected_track_index();
                     let new_idx = if current_idx >= new_count { new_count - 1 } else { current_idx };
 
                     if new_idx >= 0 {
                         state.project.as_ref().and_then(|p| {
-                            p.album.tracks.get(new_idx as usize).map(|t| {
-                                (new_idx, t.title.clone(), t.pregap.as_secs(), t.number)
-                            })
+                            p.album.tracks.get(new_idx as usize).map(|t| t.number as i32)
                         })
                     } else {
                         None
@@ -1109,20 +1187,7 @@ fn main() -> Result<(), slint::PlatformError> {
                     None
                 };
 
-                // Extract waveform if we have a track
-                let waveform_data = if let Some((_, _, _, track_num)) = track_data {
-                    if state.extract_waveform(track_num).is_some() {
-                        let peaks = state.get_visible_peaks();
-                        let duration = state.current_waveform.as_ref().map(|c| c.duration_str.clone()).unwrap_or_default();
-                        Some((peaks, duration))
-                    } else {
-                        None
-                    }
-                } else {
-                    None
-                };
-
-                (tracks, new_count, track_data, waveform_data)
+                (tracks, new_count, new_track_num)
             };
 
             // Now update UI without holding borrows
@@ -1136,16 +1201,9 @@ fn main() -> Result<(), slint::PlatformError> {
                     app.set_current_track_pregap("0".into());
                     app.set_waveform_peaks(std::rc::Rc::new(slint::VecModel::from(Vec::<WaveformPeak>::new())).into());
                     app.set_waveform_duration("0:00".into());
-                } else if let Some((new_idx, title, pregap, _)) = track_data {
-                    app.set_selected_track_index(new_idx);
-                    app.set_current_track_title(title.into());
-                    app.set_current_track_pregap(pregap.to_string().into());
-                    app.set_playhead_position(0.0);
-
-                    if let Some((peaks, duration)) = waveform_data {
-                        app.set_waveform_peaks(std::rc::Rc::new(slint::VecModel::from(peaks)).into());
-                        app.set_waveform_duration(duration.into());
-                    }
+                } else if let Some(track_num) = new_track_num {
+                    // Use invoke_select_track to handle async waveform loading
+                    app.invoke_select_track(track_num);
                 }
                 app.set_status_message(format!("Removed track {}", track_num).into());
             }
@@ -1177,8 +1235,8 @@ fn main() -> Result<(), slint::PlatformError> {
         let from_idx = from_index as usize;
         let to_idx = to_index as usize;
 
-        // First pass: reorder tracks and get metadata
-        let (tracks, new_selected_idx, track_metadata) = {
+        // Reorder tracks and get data for UI update
+        let (tracks, track_num) = {
             let mut state = state_clone.borrow_mut();
             let Some(ref mut project) = state.project else {
                 return;
@@ -1209,53 +1267,29 @@ fn main() -> Result<(), slint::PlatformError> {
                 track.number = (i + 1) as u8;
             }
 
-            // Get metadata for the moved track (now at insert_idx)
-            let track_metadata = project.album.tracks.get(insert_idx).map(|t| {
-                (t.title.clone(), t.pregap.as_secs(), t.number)
-            });
+            // Get track number for the moved track (now at insert_idx)
+            let track_num = project.album.tracks.get(insert_idx).map(|t| t.number as i32);
 
             // Prepare UI data
             let tracks = state.tracks_to_model();
 
             // Invalidate waveform cache since track numbers changed
-            state.current_waveform = None;
+            state.waveform_cache.clear();
+            state.displayed_track_num = None;
 
-            (tracks, insert_idx as i32, track_metadata)
-        };
-
-        // Second pass: extract waveform (needs separate borrow)
-        let waveform_data = if let Some((_, _, track_num)) = track_metadata {
-            let mut state = state_clone.borrow_mut();
-            if state.extract_waveform(track_num).is_some() {
-                let peaks = state.get_visible_peaks();
-                let duration = state.current_waveform.as_ref().map(|c| c.duration_str.clone()).unwrap_or_default();
-                Some((peaks, duration))
-            } else {
-                None
-            }
-        } else {
-            None
+            (tracks, track_num)
         };
 
         // Update UI
         if let Some(app) = app_weak.upgrade() {
             let model = Rc::new(slint::VecModel::from(tracks));
             app.set_tracks(model.into());
-            app.set_selected_track_index(new_selected_idx);
 
-            // Update metadata editor
-            if let Some((title, pregap, _)) = track_metadata {
-                app.set_current_track_title(title.into());
-                app.set_current_track_pregap(pregap.to_string().into());
+            // Use invoke_select_track to handle async waveform loading
+            if let Some(track_num) = track_num {
+                app.invoke_select_track(track_num);
             }
 
-            // Update waveform
-            if let Some((peaks, duration)) = waveform_data {
-                app.set_waveform_peaks(Rc::new(slint::VecModel::from(peaks)).into());
-                app.set_waveform_duration(duration.into());
-            }
-
-            app.set_playhead_position(0.0);
             app.set_status_message("Track reordered".into());
         }
     });
@@ -1367,11 +1401,36 @@ fn main() -> Result<(), slint::PlatformError> {
     let state_for_timer = state.clone();
     let completed_for_timer = completed_conversions.clone();
     let done_for_timer = conversion_done.clone();
+    let waveform_result_for_timer = waveform_result.clone();
     let timer = slint::Timer::default();
     timer.start(
         slint::TimerMode::Repeated,
         std::time::Duration::from_millis(50),
         move || {
+            // Check for completed waveform loading
+            if let Ok(mut result) = waveform_result_for_timer.try_lock() {
+                if let Some((track_num, waveform_data, duration_str)) = result.take() {
+                    if let Some(app) = app_weak.upgrade() {
+                        let mut state = state_for_timer.borrow_mut();
+
+                        // Store in cache
+                        state.insert_waveform(track_num, waveform_data, duration_str.clone());
+
+                        // Update UI only if this is still the displayed track
+                        if state.displayed_track_num == Some(track_num) {
+                            let peaks = state.get_visible_peaks();
+                            drop(state); // Release borrow before UI updates
+
+                            let model = Rc::new(slint::VecModel::from(peaks));
+                            app.set_waveform_peaks(model.into());
+                            app.set_waveform_duration(duration_str.into());
+                            app.set_waveform_loading(false);
+                            app.set_status_message(format!("Track {} loaded", track_num).into());
+                        }
+                    }
+                }
+            }
+
             // Check for completed transcoding
             if done_for_timer.load(std::sync::atomic::Ordering::SeqCst) {
                 done_for_timer.store(false, std::sync::atomic::Ordering::SeqCst);
@@ -1464,42 +1523,15 @@ fn main() -> Result<(), slint::PlatformError> {
                         if next_index < tracks.row_count() as i32 {
                             // There's a next track - select and play it
                             if let Some(next_track) = tracks.row_data(next_index as usize) {
-                                let track_num = next_track.number as u8;
+                                let track_num = next_track.number;
 
-                                // Update metadata editor fields
-                                app.set_current_track_title(next_track.title.clone());
-                                app.set_current_track_pregap(next_track.pregap.clone());
+                                // Use invoke_select_track which handles async waveform loading
+                                // The select_track callback will see was_playing=true because
+                                // we'll still be in "playing" state until after this
+                                app.invoke_select_track(track_num);
 
-                                // Load the next track
-                                let mut state = state_for_timer.borrow_mut();
-                                if let Some(track) = state.get_track(track_num) {
-                                    let path = track.source_file.clone();
-                                    state.current_track_path = Some(path.clone());
-                                    state.current_track_num = Some(track_num);
-                                    engine_for_timer.load(path);
-                                }
-
-                                // Extract waveform
-                                if state.extract_waveform(track_num).is_some() {
-                                    let peaks = state.get_visible_peaks();
-                                    let duration = state.current_waveform.as_ref().map(|c| c.duration_str.clone()).unwrap_or_default();
-
-                                    let model = Rc::new(slint::VecModel::from(peaks));
-                                    app.set_waveform_peaks(model.into());
-                                    app.set_waveform_duration(duration.into());
-                                }
-
-                                app.set_selected_track_index(next_index);
-                                app.set_playhead_position(0.0);
-                                drop(state);
-
-                                // Start playing the next track
+                                // Start playing after the track is loaded
                                 engine_for_timer.play();
-                                let mut playback = app.get_playback();
-                                playback.is_playing = true;
-                                playback.is_paused = false;
-                                app.set_playback(playback);
-                                app.set_status_message(format!("Playing track {}", track_num).into());
                             }
                         } else {
                             // This was the last track - stop playback
