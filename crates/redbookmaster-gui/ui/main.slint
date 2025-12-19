@@ -217,7 +217,6 @@ export component MainWindow inherits Window {
     in-out property <string> current-track-pregap: "0";
 
     // Internal state
-    property <int> hover-track: -1;
     in property <float> zoom-level: 1.0;
     in property <float> waveform-scroll-offset: 0.0;
 
@@ -564,7 +563,7 @@ export component MainWindow inherits Window {
                                 height: 36px;
                                 border-radius: 4px;
                                 background: idx == root.selected-track-index ? Theme.track-selected :
-                                           (idx == root.hover-track ? Theme.button-hover : transparent);
+                                           (track-touch.has-hover ? Theme.button-hover : transparent);
                                 // Dim the track being dragged
                                 opacity: root.is-dragging && idx == root.dragging-track-index ? 0.5 : 1.0;
 
@@ -609,8 +608,6 @@ export component MainWindow inherits Window {
                                             root.is-dragging = false;
                                             root.dragging-track-index = -1;
                                             root.drop-target-index = -1;
-                                        } else if e.kind == PointerEventKind.move {
-                                            root.hover-track = idx;
                                         }
                                     }
 
