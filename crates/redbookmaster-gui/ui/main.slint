@@ -305,29 +305,7 @@ export component MainWindow inherits Window {
                 spacing: 4px;
                 alignment: start;
 
-                // File menu
-                menu-button := Rectangle {
-                    width: 50px;
-                    height: 28px;
-                    border-radius: 4px;
-                    background: menu-touch.has-hover ? Theme.button-hover : transparent;
-
-                    menu-touch := TouchArea {
-                        clicked => { root.new-project(); }
-                    }
-
-                    Text {
-                        text: "File";
-                        color: Theme.text-primary;
-                        font-size: 13px;
-                        horizontal-alignment: center;
-                        vertical-alignment: center;
-                    }
-                }
-
                 // Quick action buttons
-                Rectangle { width: 16px; }
-
                 new-btn := Rectangle {
                     width: 70px;
                     height: 28px;
