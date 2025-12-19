@@ -573,6 +573,34 @@ fn main() -> Result<(), slint::PlatformError> {
         }
     });
 
+    // Previous track
+    let app_weak = app.as_weak();
+    app.on_prev_track(move || {
+        if let Some(app) = app_weak.upgrade() {
+            let current_index = app.get_selected_track_index();
+            if current_index > 0 {
+                let tracks = app.get_tracks();
+                if let Some(track) = tracks.row_data((current_index - 1) as usize) {
+                    app.invoke_select_track(track.number);
+                }
+            }
+        }
+    });
+
+    // Next track
+    let app_weak = app.as_weak();
+    app.on_next_track(move || {
+        if let Some(app) = app_weak.upgrade() {
+            let current_index = app.get_selected_track_index();
+            let tracks = app.get_tracks();
+            if current_index < (tracks.row_count() as i32) - 1 {
+                if let Some(track) = tracks.row_data((current_index + 1) as usize) {
+                    app.invoke_select_track(track.number);
+                }
+            }
+        }
+    });
+
     let engine_clone = audio_engine.clone();
     app.on_seek(move |pos| {
         engine_clone.seek(pos);

@@ -193,6 +193,8 @@ export component MainWindow inherits Window {
     callback play();
     callback pause();
     callback stop();
+    callback prev-track();
+    callback next-track();
     callback seek(float);
     callback set-volume(float);
     callback select-track(int);
@@ -821,6 +823,33 @@ export component MainWindow inherits Window {
                             spacing: 16px;
                             alignment: center;
 
+                        // Previous track button
+                        VerticalLayout {
+                            alignment: center;
+                            Rectangle {
+                                property <bool> enabled: root.tracks.length > 0 && root.selected-track-index > 0;
+
+                                width: 36px;
+                                height: 36px;
+                                border-radius: 4px;
+                                background: prev-touch.has-hover && enabled ? Theme.button-hover : Theme.button-background;
+                                opacity: enabled ? 1.0 : 0.5;
+
+                                prev-touch := TouchArea {
+                                    enabled: parent.enabled;
+                                    clicked => { root.prev-track(); }
+                                }
+
+                                Text {
+                                    text: "⏮";
+                                    color: Theme.text-primary;
+                                    font-size: 16px;
+                                    horizontal-alignment: center;
+                                    vertical-alignment: center;
+                                }
+                            }
+                        }
+
                         // Play/Pause button
                         Rectangle {
                             property <bool> enabled: root.tracks.length > 0;
@@ -876,6 +905,33 @@ export component MainWindow inherits Window {
                                     width: 16px;
                                     height: 16px;
                                     background: Theme.text-primary;
+                                }
+                            }
+                        }
+
+                        // Next track button
+                        VerticalLayout {
+                            alignment: center;
+                            Rectangle {
+                                property <bool> enabled: root.tracks.length > 0 && root.selected-track-index < root.tracks.length - 1;
+
+                                width: 36px;
+                                height: 36px;
+                                border-radius: 4px;
+                                background: next-touch.has-hover && enabled ? Theme.button-hover : Theme.button-background;
+                                opacity: enabled ? 1.0 : 0.5;
+
+                                next-touch := TouchArea {
+                                    enabled: parent.enabled;
+                                    clicked => { root.next-track(); }
+                                }
+
+                                Text {
+                                    text: "⏭";
+                                    color: Theme.text-primary;
+                                    font-size: 16px;
+                                    horizontal-alignment: center;
+                                    vertical-alignment: center;
                                 }
                             }
                         }
