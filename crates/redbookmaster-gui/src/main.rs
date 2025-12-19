@@ -11,6 +11,8 @@ use std::sync::Arc;
 use redbookmaster_lib::{Album, Project, Track, extract_peaks, WaveformData};
 use redbookmaster_lib::core::track::format_duration_ms;
 use redbookmaster_lib::audio::concat::concatenate_tracks;
+use redbookmaster_lib::audio::convert::convert_to_red_book;
+use redbookmaster_lib::audio::wav::{read_wav_info, WavInfo};
 use redbookmaster_lib::{generate_cue, generate_toc};
 use redbookmaster_lib::{Cdrdao, BurnOptions, cdrdao_available, list_drives};
 use slint::Model;
@@ -33,6 +35,8 @@ struct AppState {
     zoom_level: f32,
     /// Scroll offset for zoomed view (0.0 to 1.0 - zoom_range)
     scroll_offset: f32,
+    /// Files pending transcoding (path, wav_info)
+    pending_transcode_files: Vec<(PathBuf, WavInfo)>,
 }
 
 /// Cached waveform data
@@ -53,6 +57,7 @@ impl AppState {
             current_track_num: None,
             zoom_level: 1.0,
             scroll_offset: 0.0,
+            pending_transcode_files: Vec::new(),
         }
     }
 
@@ -284,11 +289,13 @@ fn main() -> Result<(), slint::PlatformError> {
 
             let project = state.project.as_mut().unwrap();
             let mut added = 0;
+            let mut needs_transcoding: Vec<(PathBuf, WavInfo)> = Vec::new();
 
             for path in files {
-                match redbookmaster_lib::read_wav_info(&path) {
+                match read_wav_info(&path) {
                     Ok(info) => {
                         if info.is_red_book_compliant() {
+                            // Add compliant files immediately
                             let title = path.file_stem()
                                 .and_then(|s| s.to_str())
                                 .unwrap_or("Unknown")
@@ -303,8 +310,8 @@ fn main() -> Result<(), slint::PlatformError> {
                             project.album.add_track(track);
                             added += 1;
                         } else {
-                            eprintln!("File not Red Book compliant: {:?}", path);
-                            // TODO: Show conversion dialog
+                            // Collect non-compliant files for transcoding dialog
+                            needs_transcoding.push((path, info));
                         }
                     }
                     Err(e) => {
@@ -314,11 +321,53 @@ fn main() -> Result<(), slint::PlatformError> {
             }
 
             if let Some(app) = app_weak.upgrade() {
+                // Update track list with compliant files added so far
                 let tracks: Vec<TrackData> = state.tracks_to_model();
                 let model = Rc::new(slint::VecModel::from(tracks));
                 app.set_tracks(model.into());
                 app.set_album(state.album_to_model());
-                app.set_status_message(format!("Added {} track(s)", added).into());
+
+                if !needs_transcoding.is_empty() {
+                    // Build transcode file info for dialog
+                    let transcode_infos: Vec<TranscodeFileInfo> = needs_transcoding.iter()
+                        .map(|(path, info)| {
+                            let filename = path.file_name()
+                                .and_then(|s| s.to_str())
+                                .unwrap_or("Unknown")
+                                .to_string();
+
+                            // Format issues in a user-friendly way
+                            let issues = info.format_issues().join(", ")
+                                .replace("Hz (needs 44100Hz)", "Hz → 44100Hz")
+                                .replace("bits (needs 16 bits)", "-bit → 16-bit")
+                                .replace("(needs stereo)", "→ Stereo");
+
+                            TranscodeFileInfo {
+                                filename: filename.into(),
+                                issues: issues.into(),
+                                path: path.to_string_lossy().to_string().into(),
+                            }
+                        })
+                        .collect();
+
+                    // Store pending files and show dialog
+                    state.pending_transcode_files = needs_transcoding;
+
+                    let model = Rc::new(slint::VecModel::from(transcode_infos));
+                    app.set_transcode_files(model.into());
+                    app.set_show_transcode_dialog(true);
+                    app.set_is_transcoding(false);
+                    app.set_transcode_progress(0.0);
+                    app.set_transcode_status("".into());
+
+                    app.set_status_message(format!(
+                        "Added {} track(s), {} need conversion",
+                        added,
+                        state.pending_transcode_files.len()
+                    ).into());
+                } else {
+                    app.set_status_message(format!("Added {} track(s)", added).into());
+                }
             }
         }
     });
@@ -1183,15 +1232,166 @@ fn main() -> Result<(), slint::PlatformError> {
         }
     });
 
+    // Cancel transcoding dialog
+    let app_weak = app.as_weak();
+    let state_clone = state.clone();
+    app.on_cancel_transcode(move || {
+        let mut state = state_clone.borrow_mut();
+        state.pending_transcode_files.clear();
+
+        if let Some(app) = app_weak.upgrade() {
+            app.set_show_transcode_dialog(false);
+            app.set_status_message("Conversion cancelled".into());
+        }
+    });
+
+    // Shared container for completed conversions (thread-safe)
+    let completed_conversions: Arc<std::sync::Mutex<Vec<(PathBuf, std::time::Duration)>>> =
+        Arc::new(std::sync::Mutex::new(Vec::new()));
+    let conversion_done: Arc<std::sync::atomic::AtomicBool> =
+        Arc::new(std::sync::atomic::AtomicBool::new(false));
+
+    // Confirm transcoding - run conversion in background thread
+    let app_weak = app.as_weak();
+    let state_clone = state.clone();
+    let completed_clone = completed_conversions.clone();
+    let done_flag = conversion_done.clone();
+    app.on_confirm_transcode(move || {
+        let mut state = state_clone.borrow_mut();
+        let pending_files = std::mem::take(&mut state.pending_transcode_files);
+
+        if pending_files.is_empty() {
+            return;
+        }
+
+        if let Some(app) = app_weak.upgrade() {
+            app.set_is_transcoding(true);
+            app.set_transcode_progress(0.0);
+        }
+
+        // Clone what we need for the thread
+        let app_weak_clone = app_weak.clone();
+        let completed_for_thread = completed_clone.clone();
+        let done_for_thread = done_flag.clone();
+
+        // Spawn background thread for transcoding
+        std::thread::spawn(move || {
+            let total = pending_files.len();
+            let mut converted_paths: Vec<(PathBuf, std::time::Duration)> = Vec::new();
+
+            for (i, (input_path, _info)) in pending_files.into_iter().enumerate() {
+                // Update progress in UI
+                let filename = input_path.file_name()
+                    .and_then(|s| s.to_str())
+                    .unwrap_or("file")
+                    .to_string();
+
+                let progress = i as f32 / total as f32;
+                let status = format!("Converting {}...", filename);
+
+                // Update UI from main thread
+                let app_weak_status = app_weak_clone.clone();
+                let _ = slint::invoke_from_event_loop(move || {
+                    if let Some(app) = app_weak_status.upgrade() {
+                        app.set_transcode_progress(progress);
+                        app.set_transcode_status(status.into());
+                    }
+                });
+
+                // Create output path in _converted subdirectory
+                let parent = input_path.parent().unwrap_or(std::path::Path::new("."));
+                let converted_dir = parent.join("_converted");
+                if !converted_dir.exists() {
+                    if let Err(e) = std::fs::create_dir_all(&converted_dir) {
+                        eprintln!("Failed to create _converted directory: {}", e);
+                        continue;
+                    }
+                }
+
+                let output_filename = input_path.file_name().unwrap_or_default();
+                let output_path = converted_dir.join(output_filename);
+
+                // Perform conversion
+                match convert_to_red_book(&input_path, &output_path) {
+                    Ok(_) => {
+                        // Read the converted file to get duration
+                        if let Ok(info) = read_wav_info(&output_path) {
+                            converted_paths.push((output_path, info.duration));
+                        }
+                    }
+                    Err(e) => {
+                        eprintln!("Failed to convert {:?}: {}", input_path, e);
+                    }
+                }
+            }
+
+            // Store converted paths and signal completion
+            if let Ok(mut completed) = completed_for_thread.lock() {
+                *completed = converted_paths;
+            }
+            done_for_thread.store(true, std::sync::atomic::Ordering::SeqCst);
+        });
+    });
+
     // Set up a timer to poll for position updates from the audio engine
     let app_weak = app.as_weak();
     let engine_for_timer = audio_engine.clone();
     let state_for_timer = state.clone();
+    let completed_for_timer = completed_conversions.clone();
+    let done_for_timer = conversion_done.clone();
     let timer = slint::Timer::default();
     timer.start(
         slint::TimerMode::Repeated,
         std::time::Duration::from_millis(50),
         move || {
+            // Check for completed transcoding
+            if done_for_timer.load(std::sync::atomic::Ordering::SeqCst) {
+                done_for_timer.store(false, std::sync::atomic::Ordering::SeqCst);
+
+                let converted_paths = {
+                    let mut completed = completed_for_timer.lock().unwrap();
+                    std::mem::take(&mut *completed)
+                };
+
+                if !converted_paths.is_empty() {
+                    if let Some(app) = app_weak.upgrade() {
+                        let mut state = state_for_timer.borrow_mut();
+
+                        // Ensure project exists
+                        if state.project.is_none() {
+                            state.new_project();
+                        }
+
+                        let project = state.project.as_mut().unwrap();
+                        let mut added = 0;
+
+                        for (path, duration) in converted_paths {
+                            let title = path.file_stem()
+                                .and_then(|s| s.to_str())
+                                .unwrap_or("Unknown")
+                                .to_string();
+
+                            let track = Track::new(
+                                (project.album.track_count() + 1) as u8,
+                                title,
+                                path,
+                                duration,
+                            );
+                            project.album.add_track(track);
+                            added += 1;
+                        }
+
+                        // Update UI
+                        let tracks: Vec<TrackData> = state.tracks_to_model();
+                        let model = Rc::new(slint::VecModel::from(tracks));
+                        app.set_tracks(model.into());
+                        app.set_show_transcode_dialog(false);
+                        app.set_is_transcoding(false);
+                        app.set_status_message(format!("Converted and added {} track(s)", added).into());
+                    }
+                }
+            }
+
             // Process events from audio engine
             while let Some(event) = engine_for_timer.try_recv_event() {
                 let Some(app) = app_weak.upgrade() else { return };

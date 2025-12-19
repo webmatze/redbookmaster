@@ -58,6 +58,13 @@ export struct PlaybackState {
     volume: float,
 }
 
+// File info for transcoding dialog
+export struct TranscodeFileInfo {
+    filename: string,
+    issues: string,
+    path: string,
+}
+
 // Waveform display component
 component WaveformView inherits Rectangle {
     in property <[WaveformPeak]> peaks: [];
@@ -200,6 +207,8 @@ export component MainWindow inherits Window {
     callback zoom-out();
     callback waveform-scroll(float);  // scroll delta (-1.0 to 1.0)
     callback reorder-tracks(int, int);  // from-index, to-index
+    callback confirm-transcode();
+    callback cancel-transcode();
 
     // Properties bound to Rust
     in property <[TrackData]> tracks: [];
@@ -224,6 +233,13 @@ export component MainWindow inherits Window {
     property <int> dragging-track-index: -1;
     property <int> drop-target-index: -1;
     property <bool> is-dragging: false;
+
+    // Transcode dialog state
+    in property <bool> show-transcode-dialog: false;
+    in property <[TranscodeFileInfo]> transcode-files: [];
+    in property <string> transcode-status: "";
+    in property <float> transcode-progress: 0.0;
+    in property <bool> is-transcoding: false;
 
     // Helper to format position as M:SS
     pure function format-time(seconds: float) -> string {
@@ -1134,4 +1150,181 @@ export component MainWindow inherits Window {
         }
         } // end VerticalLayout
     } // end FocusScope
+
+    // Transcode dialog overlay
+    if root.show-transcode-dialog: Rectangle {
+        x: 0;
+        y: 0;
+        width: 100%;
+        height: 100%;
+        background: #000000aa;
+
+        // Block clicks on background
+        TouchArea {}
+
+        // Dialog panel
+        Rectangle {
+            width: 500px;
+            height: root.is-transcoding ? 380px : 340px;
+            x: (parent.width - self.width) / 2;
+            y: (parent.height - self.height) / 2;
+            background: Theme.panel-background;
+            border-radius: 12px;
+            border-width: 1px;
+            border-color: Theme.panel-border;
+
+            VerticalLayout {
+                padding: 24px;
+                spacing: 16px;
+
+                // Title
+                Text {
+                    text: "Files Need Conversion";
+                    color: Theme.text-primary;
+                    font-size: 18px;
+                    font-weight: 600;
+                    horizontal-alignment: center;
+                }
+
+                // Explanation
+                Text {
+                    text: "The following files need to be converted to\nRed Book CD format (44.1kHz, 16-bit, Stereo):";
+                    color: Theme.text-secondary;
+                    font-size: 13px;
+                    horizontal-alignment: center;
+                }
+
+                // File list
+                Rectangle {
+                    background: Theme.input-background;
+                    border-radius: 6px;
+                    height: 120px;
+
+                    ScrollView {
+                        VerticalLayout {
+                            padding: 8px;
+                            spacing: 8px;
+
+                            for file in root.transcode-files: Rectangle {
+                                background: transparent;
+                                height: 40px;
+
+                                VerticalLayout {
+                                    spacing: 2px;
+                                    padding-left: 8px;
+
+                                    Text {
+                                        text: file.filename;
+                                        color: Theme.text-primary;
+                                        font-size: 13px;
+                                        overflow: elide;
+                                    }
+                                    Text {
+                                        text: file.issues;
+                                        color: Theme.accent;
+                                        font-size: 11px;
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+
+                // Info note
+                HorizontalLayout {
+                    spacing: 8px;
+                    alignment: center;
+
+                    Text {
+                        text: "ℹ";
+                        color: Theme.accent;
+                        font-size: 14px;
+                    }
+                    Text {
+                        text: "Original files will not be modified.\nConverted copies will be created.";
+                        color: Theme.text-secondary;
+                        font-size: 12px;
+                    }
+                }
+
+                // Progress section (shown during transcoding)
+                if root.is-transcoding: VerticalLayout {
+                    spacing: 8px;
+
+                    Text {
+                        text: root.transcode-status;
+                        color: Theme.text-secondary;
+                        font-size: 12px;
+                        horizontal-alignment: center;
+                    }
+
+                    Rectangle {
+                        height: 6px;
+                        background: Theme.input-background;
+                        border-radius: 3px;
+
+                        Rectangle {
+                            x: 0;
+                            y: 0;
+                            width: parent.width * root.transcode-progress;
+                            height: parent.height;
+                            background: Theme.accent;
+                            border-radius: 3px;
+                        }
+                    }
+                }
+
+                // Buttons
+                HorizontalLayout {
+                    spacing: 12px;
+                    alignment: center;
+
+                    // Cancel button
+                    Rectangle {
+                        width: 100px;
+                        height: 36px;
+                        border-radius: 6px;
+                        background: cancel-touch.has-hover ? Theme.button-hover : Theme.button-background;
+                        opacity: root.is-transcoding ? 0.5 : 1.0;
+
+                        cancel-touch := TouchArea {
+                            enabled: !root.is-transcoding;
+                            clicked => { root.cancel-transcode(); }
+                        }
+
+                        Text {
+                            text: "Cancel";
+                            color: Theme.text-primary;
+                            font-size: 14px;
+                            horizontal-alignment: center;
+                            vertical-alignment: center;
+                        }
+                    }
+
+                    // Convert button
+                    Rectangle {
+                        width: 100px;
+                        height: 36px;
+                        border-radius: 6px;
+                        background: convert-touch.has-hover && !root.is-transcoding ? Theme.accent-hover : Theme.accent;
+                        opacity: root.is-transcoding ? 0.5 : 1.0;
+
+                        convert-touch := TouchArea {
+                            enabled: !root.is-transcoding;
+                            clicked => { root.confirm-transcode(); }
+                        }
+
+                        Text {
+                            text: root.is-transcoding ? "Converting..." : "Convert";
+                            color: Theme.text-primary;
+                            font-size: 14px;
+                            font-weight: 600;
+                            horizontal-alignment: center;
+                            vertical-alignment: center;
+                        }
+                    }
+                }
+            }
+        }
+    }
 }
