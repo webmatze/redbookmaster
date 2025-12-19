@@ -518,8 +518,15 @@ fn main() -> Result<(), slint::PlatformError> {
     });
 
     let engine_clone = audio_engine.clone();
+    let app_weak = app.as_weak();
     app.on_set_volume(move |vol| {
         engine_clone.set_volume(vol);
+        // Update UI to reflect new volume
+        if let Some(app) = app_weak.upgrade() {
+            let mut playback = app.get_playback();
+            playback.volume = vol;
+            app.set_playback(playback);
+        }
     });
 
     let engine_clone = audio_engine.clone();
