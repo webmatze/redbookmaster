@@ -905,6 +905,8 @@ export component MainWindow inherits Window {
                                 border-radius: 3px;
 
                                 Rectangle {
+                                    x: 0;
+                                    y: 0;
                                     width: root.playback.duration > 0 ?
                                            parent.width * (root.playback.position / root.playback.duration) : 0px;
                                     height: parent.height;
@@ -939,6 +941,8 @@ export component MainWindow inherits Window {
                                 }
 
                                 Rectangle {
+                                    x: 0;
+                                    y: 0;
                                     width: parent.width * root.playback.volume;
                                     height: parent.height;
                                     background: Theme.accent;
