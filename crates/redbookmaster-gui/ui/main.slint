@@ -936,10 +936,16 @@ export component MainWindow inherits Window {
 
                                 vol-touch := TouchArea {
                                     clicked => {
-                                        root.set-volume(self.mouse-x / parent.width);
+                                        root.set-volume(max(0.0, min(1.0, self.mouse-x / parent.width)));
+                                    }
+                                    moved => {
+                                        if self.pressed {
+                                            root.set-volume(max(0.0, min(1.0, self.mouse-x / parent.width)));
+                                        }
                                     }
                                 }
 
+                                // Volume fill bar
                                 Rectangle {
                                     x: 0;
                                     y: 0;
@@ -947,6 +953,18 @@ export component MainWindow inherits Window {
                                     height: parent.height;
                                     background: Theme.accent;
                                     border-radius: 3px;
+                                }
+
+                                // Draggable handle
+                                Rectangle {
+                                    x: parent.width * root.playback.volume - 6px;
+                                    y: -3px;
+                                    width: 12px;
+                                    height: 12px;
+                                    border-radius: 6px;
+                                    background: Theme.accent;
+                                    border-width: 2px;
+                                    border-color: Theme.text-primary;
                                 }
                             }
                         }
