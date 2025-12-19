@@ -18,6 +18,8 @@ use rodio::{Decoder, OutputStream, Sink, Source};
 pub enum PlayerCommand {
     /// Load a track from the given path
     Load(PathBuf),
+    /// Load a track and immediately start playing
+    LoadAndPlay(PathBuf),
     /// Start or resume playback
     Play,
     /// Pause playback
@@ -122,6 +124,11 @@ impl AudioEngine {
         self.send_command(PlayerCommand::Load(path));
     }
 
+    /// Load a track and immediately start playing
+    pub fn load_and_play(&self, path: PathBuf) {
+        self.send_command(PlayerCommand::LoadAndPlay(path));
+    }
+
     /// Start playback
     pub fn play(&self) {
         self.send_command(PlayerCommand::Play);
@@ -224,6 +231,65 @@ fn audio_thread(
                                 pause_offset_ms = 0;
 
                                 let _ = event_tx.try_send(PlayerEvent::Loaded { duration_ms });
+                            }
+                            Err(e) => {
+                                let _ = event_tx.try_send(PlayerEvent::Error(
+                                    format!("Failed to decode: {}", e)
+                                ));
+                            }
+                        }
+                    }
+                    Err(e) => {
+                        let _ = event_tx.try_send(PlayerEvent::Error(
+                            format!("Failed to open file: {}", e)
+                        ));
+                    }
+                }
+            }
+
+            Ok(PlayerCommand::LoadAndPlay(path)) => {
+                // Stop current playback by dropping old sink and creating new one
+                drop(sink.take());
+                sink = create_sink(&stream_handle, *state.volume.lock());
+
+                // Load and immediately play
+                match std::fs::File::open(&path) {
+                    Ok(file) => {
+                        let buf_reader = std::io::BufReader::new(file);
+                        match Decoder::new(buf_reader) {
+                            Ok(source) => {
+                                // Get duration
+                                let duration = source.total_duration()
+                                    .unwrap_or(Duration::from_secs(0));
+                                let duration_ms = duration.as_millis() as u64;
+
+                                // Update state
+                                state.duration_ms.store(duration_ms, Ordering::Relaxed);
+                                state.position_ms.store(0, Ordering::Relaxed);
+
+                                current_path = Some(path.clone());
+                                pause_offset_ms = 0;
+
+                                let _ = event_tx.try_send(PlayerEvent::Loaded { duration_ms });
+
+                                // Now start playing - need to re-open file since decoder consumed it
+                                if let Some(ref s) = sink {
+                                    match std::fs::File::open(&path) {
+                                        Ok(file2) => {
+                                            let buf_reader2 = std::io::BufReader::new(file2);
+                                            if let Ok(source2) = Decoder::new(buf_reader2) {
+                                                s.append(source2);
+                                                s.set_volume(*state.volume.lock());
+                                                s.play();
+                                                playback_start_time = Some(std::time::Instant::now());
+                                                state.is_playing.store(true, Ordering::Relaxed);
+                                                state.is_paused.store(false, Ordering::Relaxed);
+                                                let _ = event_tx.try_send(PlayerEvent::Playing);
+                                            }
+                                        }
+                                        Err(_) => {}
+                                    }
+                                }
                             }
                             Err(e) => {
                                 let _ = event_tx.try_send(PlayerEvent::Error(

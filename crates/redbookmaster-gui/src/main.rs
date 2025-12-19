@@ -351,14 +351,26 @@ fn main() -> Result<(), slint::PlatformError> {
             app.set_status_message(format!("Loading waveform for track {}...", track_num).into());
         }
 
+        // Check if we were playing before switching tracks
+        let was_playing = if let Some(app) = app_weak.upgrade() {
+            let playback = app.get_playback();
+            playback.is_playing && !playback.is_paused
+        } else {
+            false
+        };
+
         // Get track path for audio playback
         if let Some(track) = state.get_track(track_num as u8) {
             let path = track.source_file.clone();
             state.current_track_path = Some(path.clone());
             state.current_track_num = Some(track_num as u8);
 
-            // Load track into audio engine
-            engine_clone.load(path);
+            // Load track into audio engine, and play immediately if we were already playing
+            if was_playing {
+                engine_clone.load_and_play(path);
+            } else {
+                engine_clone.load(path);
+            }
         }
 
         // Extract waveform
