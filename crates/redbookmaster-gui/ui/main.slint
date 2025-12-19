@@ -282,6 +282,16 @@ export component MainWindow inherits Window {
                 }
                 return accept;
             }
+            // Left arrow: Previous track
+            if (event.text == Key.LeftArrow) {
+                root.prev-track();
+                return accept;
+            }
+            // Right arrow: Next track
+            if (event.text == Key.RightArrow) {
+                root.next-track();
+                return accept;
+            }
             // Delete/Backspace: Remove selected track
             if (event.text == Key.Delete || event.text == Key.Backspace) {
                 if (root.selected-track-index >= 0) {
