@@ -324,12 +324,14 @@ export component MainWindow inherits Window {
         VerticalLayout {
         // Menu bar
         Rectangle {
-            height: 32px;
+            height: 40px;
             background: Theme.panel-background;
 
             HorizontalLayout {
                 padding-left: 8px;
                 padding-right: 8px;
+                padding-top: 6px;
+                padding-bottom: 6px;
                 spacing: 4px;
 
                 // Quick action buttons
@@ -343,15 +345,12 @@ export component MainWindow inherits Window {
                         clicked => { root.new-project(); }
                     }
 
-                    HorizontalLayout {
-                        padding: 6px;
-                        spacing: 4px;
-                        Text {
-                            text: "New";
-                            color: Theme.text-primary;
-                            font-size: 12px;
-                            vertical-alignment: center;
-                        }
+                    Text {
+                        text: "New";
+                        color: Theme.text-primary;
+                        font-size: 12px;
+                        horizontal-alignment: center;
+                        vertical-alignment: center;
                     }
                 }
 
@@ -365,15 +364,12 @@ export component MainWindow inherits Window {
                         clicked => { root.open-project(); }
                     }
 
-                    HorizontalLayout {
-                        padding: 6px;
-                        spacing: 4px;
-                        Text {
-                            text: "Open";
-                            color: Theme.text-primary;
-                            font-size: 12px;
-                            vertical-alignment: center;
-                        }
+                    Text {
+                        text: "Open";
+                        color: Theme.text-primary;
+                        font-size: 12px;
+                        horizontal-alignment: center;
+                        vertical-alignment: center;
                     }
                 }
 
@@ -387,15 +383,12 @@ export component MainWindow inherits Window {
                         clicked => { root.save-project(); }
                     }
 
-                    HorizontalLayout {
-                        padding: 6px;
-                        spacing: 4px;
-                        Text {
-                            text: "Save";
-                            color: Theme.text-primary;
-                            font-size: 12px;
-                            vertical-alignment: center;
-                        }
+                    Text {
+                        text: "Save";
+                        color: Theme.text-primary;
+                        font-size: 12px;
+                        horizontal-alignment: center;
+                        vertical-alignment: center;
                     }
                 }
 
