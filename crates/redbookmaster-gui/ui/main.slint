@@ -680,24 +680,17 @@ export component MainWindow inherits Window {
 
                         // Waveform header
                         HorizontalLayout {
+                            spacing: 16px;
+
                             Text {
                                 text: root.selected-track-index >= 0 && root.selected-track-index < root.tracks.length ?
                                       root.tracks[root.selected-track-index].title : "No track selected";
                                 color: Theme.text-primary;
                                 font-size: 14px;
                                 font-weight: 600;
+                                overflow: elide;
+                                horizontal-stretch: 1;
                             }
-
-                            Rectangle { horizontal-stretch: 1; }
-
-                            // Duration
-                            Text {
-                                text: root.waveform-duration;
-                                color: Theme.text-secondary;
-                                font-size: 12px;
-                            }
-
-                            Rectangle { width: 16px; }
 
                             // Zoom controls
                             HorizontalLayout {
