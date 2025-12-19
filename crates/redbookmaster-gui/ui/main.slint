@@ -243,6 +243,9 @@ export component MainWindow inherits Window {
     in property <float> transcode-progress: 0.0;
     in property <bool> is-transcoding: false;
 
+    // Project state - controls which UI elements are enabled
+    in property <bool> has-project: false;
+
     // Helper to format position as M:SS
     pure function format-time(seconds: float) -> string {
         floor(seconds / 60) + ":" + (mod(floor(seconds), 60) < 10 ? "0" : "") + floor(mod(seconds, 60))
@@ -374,12 +377,16 @@ export component MainWindow inherits Window {
                 }
 
                 save-btn := Rectangle {
+                    property <bool> enabled: root.has-project;
                     width: 70px;
                     height: 28px;
                     border-radius: 4px;
-                    background: save-touch.has-hover ? Theme.button-hover : Theme.button-background;
+                    background: !enabled ? Theme.button-background :
+                                save-touch.has-hover ? Theme.button-hover : Theme.button-background;
+                    opacity: enabled ? 1.0 : 0.4;
 
                     save-touch := TouchArea {
+                        enabled: parent.enabled;
                         clicked => { root.save-project(); }
                     }
 
@@ -395,12 +402,16 @@ export component MainWindow inherits Window {
                 Rectangle { width: 16px; }
 
                 export-btn := Rectangle {
+                    property <bool> enabled: root.has-project;
                     width: 80px;
                     height: 28px;
                     border-radius: 4px;
-                    background: export-touch.has-hover ? Theme.accent-hover : Theme.accent;
+                    background: !enabled ? Theme.button-background :
+                                export-touch.has-hover ? Theme.accent-hover : Theme.accent;
+                    opacity: enabled ? 1.0 : 0.4;
 
                     export-touch := TouchArea {
+                        enabled: parent.enabled;
                         clicked => { root.export-master(); }
                     }
 
@@ -415,12 +426,16 @@ export component MainWindow inherits Window {
                 }
 
                 burn-btn := Rectangle {
+                    property <bool> enabled: root.has-project;
                     width: 80px;
                     height: 28px;
                     border-radius: 4px;
-                    background: burn-touch.has-hover ? Theme.accent-hover : Theme.accent;
+                    background: !enabled ? Theme.button-background :
+                                burn-touch.has-hover ? Theme.accent-hover : Theme.accent;
+                    opacity: enabled ? 1.0 : 0.4;
 
                     burn-touch := TouchArea {
+                        enabled: parent.enabled;
                         clicked => { root.burn-cd(); }
                     }
 
@@ -480,12 +495,16 @@ export component MainWindow inherits Window {
 
                         // Add tracks button
                         Rectangle {
+                            property <bool> enabled: root.has-project;
                             width: 28px;
                             height: 28px;
                             border-radius: 4px;
-                            background: add-touch.has-hover ? Theme.button-hover : Theme.button-background;
+                            background: !enabled ? Theme.button-background :
+                                        add-touch.has-hover ? Theme.button-hover : Theme.button-background;
+                            opacity: enabled ? 1.0 : 0.4;
 
                             add-touch := TouchArea {
+                                enabled: parent.enabled;
                                 clicked => { root.add-tracks(); }
                             }
 
@@ -500,7 +519,7 @@ export component MainWindow inherits Window {
 
                         // Remove track button
                         Rectangle {
-                            property <bool> enabled: root.selected-track-index >= 0;
+                            property <bool> enabled: root.has-project && root.selected-track-index >= 0;
                             width: 28px;
                             height: 28px;
                             border-radius: 4px;

@@ -1,5 +1,5 @@
 use serde::{Deserialize, Serialize};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use super::metadata::Isrc;
@@ -119,6 +119,17 @@ impl Track {
     /// Format duration as MM:SS:FF (minutes:seconds:frames)
     pub fn format_duration(&self) -> String {
         format_duration_msf(self.duration)
+    }
+
+    /// Resolve the source file path relative to a project directory.
+    /// If the path is already absolute, returns it as-is (for backwards compatibility).
+    /// If the path is relative, joins it with the project directory.
+    pub fn resolve_source_file(&self, project_dir: &Path) -> PathBuf {
+        if self.source_file.is_absolute() {
+            self.source_file.clone()
+        } else {
+            project_dir.join(&self.source_file)
+        }
     }
 }
 

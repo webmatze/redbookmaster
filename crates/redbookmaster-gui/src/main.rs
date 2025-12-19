@@ -66,19 +66,6 @@ impl AppState {
         }
     }
 
-    fn new_project(&mut self) {
-        let album = Album::new("Untitled Album".to_string(), "".to_string());
-        let project = Project::new(album);
-        self.project = Some(project);
-        self.project_path = None;
-        self.waveform_cache.clear();
-        self.displayed_track_num = None;
-        self.current_track_path = None;
-        self.current_track_num = None;
-        self.zoom_level = 1.0;
-        self.scroll_offset = 0.0;
-    }
-
     fn tracks_to_model(&self) -> Vec<TrackData> {
         let Some(project) = &self.project else {
             return Vec::new();
@@ -185,19 +172,71 @@ fn main() -> Result<(), slint::PlatformError> {
     let app_weak = app.as_weak();
     let state_clone = state.clone();
     app.on_new_project(move || {
-        let mut state = state_clone.borrow_mut();
-        state.new_project();
+        // Show save file dialog - user picks name and location
+        let dialog = rfd::FileDialog::new()
+            .set_title("Create New Project")
+            .add_filter("Red Book Master Project", &["rbm"])
+            .set_file_name("untitled.rbm");
 
-        if let Some(app) = app_weak.upgrade() {
-            let tracks: Vec<TrackData> = state.tracks_to_model();
-            let model = Rc::new(slint::VecModel::from(tracks));
-            app.set_tracks(model.into());
-            app.set_album(state.album_to_model());
-            app.set_status_message("New project created".into());
-            app.set_selected_track_index(-1);
-            // Clear waveform
-            app.set_waveform_peaks(Rc::new(slint::VecModel::from(Vec::<WaveformPeak>::new())).into());
-            app.set_waveform_duration("0:00".into());
+        if let Some(path) = dialog.save_file() {
+            // Get project name from the chosen filename (without extension)
+            let project_name = path.file_stem()
+                .and_then(|n| n.to_str())
+                .unwrap_or("project")
+                .to_string();
+
+            // Get parent directory where user wants to save
+            let parent_dir = path.parent().unwrap_or(std::path::Path::new("."));
+
+            // Create project directory: {parent}/{name}_rbm/
+            let project_dir = parent_dir.join(format!("{}_rbm", &project_name));
+            if let Err(e) = std::fs::create_dir_all(&project_dir) {
+                if let Some(app) = app_weak.upgrade() {
+                    app.set_status_message(format!("Failed to create project directory: {}", e).into());
+                }
+                return;
+            }
+
+            // Create project file inside: {parent}/{name}_rbm/{name}.rbm
+            let project_file = project_dir.join(format!("{}.rbm", &project_name));
+
+            let mut state = state_clone.borrow_mut();
+
+            // Create project with project name as album title
+            let album = Album::new(project_name.clone(), "".to_string());
+            let mut project = Project::new(album);
+            project.project_dir = Some(project_dir.clone());
+            project.file_path = Some(project_file.clone());
+
+            // Auto-save immediately
+            if let Err(e) = project.save_to(&project_file) {
+                if let Some(app) = app_weak.upgrade() {
+                    app.set_status_message(format!("Failed to create project: {}", e).into());
+                }
+                return;
+            }
+
+            state.project = Some(project);
+            state.project_path = Some(project_file.clone());
+            state.waveform_cache.clear();
+            state.displayed_track_num = None;
+            state.current_track_path = None;
+            state.current_track_num = None;
+            state.zoom_level = 1.0;
+            state.scroll_offset = 0.0;
+
+            if let Some(app) = app_weak.upgrade() {
+                let tracks: Vec<TrackData> = state.tracks_to_model();
+                let model = Rc::new(slint::VecModel::from(tracks));
+                app.set_tracks(model.into());
+                app.set_album(state.album_to_model());
+                app.set_status_message(format!("Created project: {}", project_dir.display()).into());
+                app.set_selected_track_index(-1);
+                app.set_has_project(true);
+                // Clear waveform
+                app.set_waveform_peaks(Rc::new(slint::VecModel::from(Vec::<WaveformPeak>::new())).into());
+                app.set_waveform_duration("0:00".into());
+            }
         }
     });
 
@@ -224,6 +263,7 @@ fn main() -> Result<(), slint::PlatformError> {
                         app.set_album(state.album_to_model());
                         app.set_status_message(format!("Opened: {}", path.display()).into());
                         app.set_selected_track_index(-1);
+                        app.set_has_project(true);
                         // Clear waveform
                         app.set_waveform_peaks(Rc::new(slint::VecModel::from(Vec::<WaveformPeak>::new())).into());
                         app.set_waveform_duration("0:00".into());
@@ -279,17 +319,23 @@ fn main() -> Result<(), slint::PlatformError> {
     let app_weak = app.as_weak();
     let state_clone = state.clone();
     app.on_add_tracks(move || {
+        // First check if we have a project
+        {
+            let state = state_clone.borrow();
+            if state.project.is_none() {
+                if let Some(app) = app_weak.upgrade() {
+                    app.set_status_message("Create a project first (File → New Project)".into());
+                }
+                return;
+            }
+        }
+
         let dialog = rfd::FileDialog::new()
             .add_filter("WAV Audio", &["wav", "WAV"])
             .set_title("Select WAV files to add");
 
         if let Some(files) = dialog.pick_files() {
             let mut state = state_clone.borrow_mut();
-
-            // Create a new project if none exists
-            if state.project.is_none() {
-                state.new_project();
-            }
 
             let project = state.project.as_mut().unwrap();
             let mut added = 0;
@@ -299,16 +345,19 @@ fn main() -> Result<(), slint::PlatformError> {
                 match read_wav_info(&path) {
                     Ok(info) => {
                         if info.is_red_book_compliant() {
-                            // Add compliant files immediately
+                            // Get title from filename
                             let title = path.file_stem()
                                 .and_then(|s| s.to_str())
                                 .unwrap_or("Unknown")
                                 .to_string();
 
+                            let track_num = project.album.track_count() + 1;
+
+                            // Create track with ABSOLUTE path (no copying)
                             let track = Track::new(
-                                (project.album.track_count() + 1) as u8,
+                                track_num as u8,
                                 title,
-                                path,
+                                path.clone(),  // Store original absolute path
                                 info.duration,
                             );
                             project.album.add_track(track);
@@ -320,6 +369,17 @@ fn main() -> Result<(), slint::PlatformError> {
                     }
                     Err(e) => {
                         eprintln!("Failed to read WAV: {}", e);
+                    }
+                }
+            }
+
+            // Auto-save project after adding tracks
+            if added > 0 {
+                if let Some(ref path) = state.project_path {
+                    if let Some(ref project) = state.project {
+                        if let Err(e) = project.save_to(path) {
+                            eprintln!("Auto-save failed: {}", e);
+                        }
                     }
                 }
             }
@@ -424,7 +484,11 @@ fn main() -> Result<(), slint::PlatformError> {
 
         // Get track info for audio playback and async waveform loading
         let track_info = if let Some(track) = state.get_track(track_num_u8) {
-            let path = track.source_file.clone();
+            // Resolve relative path using project_dir
+            let path = state.project.as_ref()
+                .and_then(|p| p.project_dir.as_ref())
+                .map(|dir| track.resolve_source_file(dir))
+                .unwrap_or_else(|| track.source_file.clone());
             let duration = track.duration;
             state.current_track_path = Some(path.clone());
             state.current_track_num = Some(track_num_u8);
@@ -554,6 +618,14 @@ fn main() -> Result<(), slint::PlatformError> {
             if let Some(app) = app_weak.upgrade() {
                 app.set_album(state.album_to_model());
             }
+            // Auto-save project
+            if let Some(ref path) = state.project_path {
+                if let Some(ref project) = state.project {
+                    if let Err(e) = project.save_to(path) {
+                        eprintln!("Auto-save failed: {}", e);
+                    }
+                }
+            }
         }
     });
 
@@ -565,6 +637,14 @@ fn main() -> Result<(), slint::PlatformError> {
             project.album.performer = performer.to_string();
             if let Some(app) = app_weak.upgrade() {
                 app.set_album(state.album_to_model());
+            }
+            // Auto-save project
+            if let Some(ref path) = state.project_path {
+                if let Some(ref project) = state.project {
+                    if let Err(e) = project.save_to(path) {
+                        eprintln!("Auto-save failed: {}", e);
+                    }
+                }
             }
         }
     });
@@ -580,6 +660,14 @@ fn main() -> Result<(), slint::PlatformError> {
                     let tracks: Vec<TrackData> = state.tracks_to_model();
                     let model = Rc::new(slint::VecModel::from(tracks));
                     app.set_tracks(model.into());
+                }
+                // Auto-save project
+                if let Some(ref path) = state.project_path {
+                    if let Some(ref project) = state.project {
+                        if let Err(e) = project.save_to(path) {
+                            eprintln!("Auto-save failed: {}", e);
+                        }
+                    }
                 }
             }
         }
@@ -805,6 +893,14 @@ fn main() -> Result<(), slint::PlatformError> {
             return;
         };
 
+        // Require project directory
+        let Some(ref project_dir) = project.project_dir else {
+            if let Some(app) = app_weak.upgrade() {
+                app.set_status_message("No project directory - save project first".into());
+            }
+            return;
+        };
+
         if project.album.tracks.is_empty() {
             if let Some(app) = app_weak.upgrade() {
                 app.set_status_message("No tracks to export".into());
@@ -820,14 +916,7 @@ fn main() -> Result<(), slint::PlatformError> {
             return;
         }
 
-        // Open folder selection dialog
-        let dialog = rfd::FileDialog::new()
-            .set_title("Select Export Directory");
-
-        let Some(output_dir) = dialog.pick_folder() else {
-            return;
-        };
-
+        // Export directly to project_dir (which is {name}_rbm/)
         if let Some(app) = app_weak.upgrade() {
             app.set_status_message("Exporting...".into());
         }
@@ -838,16 +927,24 @@ fn main() -> Result<(), slint::PlatformError> {
             .to_lowercase();
         let base_name = if base_name.is_empty() { "master".to_string() } else { base_name };
 
-        let wav_path = output_dir.join(format!("{}.wav", base_name));
-        let cue_path = output_dir.join(format!("{}.cue", base_name));
-        let toc_path = output_dir.join(format!("{}.toc", base_name));
+        let wav_path = project_dir.join(format!("{}.wav", base_name));
+        let cue_path = project_dir.join(format!("{}.cue", base_name));
+        let toc_path = project_dir.join(format!("{}.toc", base_name));
 
         // Step 1: Concatenate tracks into master WAV
+        // Resolve relative paths for concatenation
         if let Some(app) = app_weak.upgrade() {
             app.set_status_message("Creating master WAV file...".into());
         }
 
-        if let Err(e) = concatenate_tracks(&project.album.tracks, &wav_path) {
+        // Create tracks with resolved paths for concatenation
+        let resolved_tracks: Vec<Track> = project.album.tracks.iter().map(|t| {
+            let mut resolved = t.clone();
+            resolved.source_file = t.resolve_source_file(project_dir);
+            resolved
+        }).collect();
+
+        if let Err(e) = concatenate_tracks(&resolved_tracks, &wav_path) {
             if let Some(app) = app_weak.upgrade() {
                 app.set_status_message(format!("Export failed: {}", e).into());
             }
@@ -881,7 +978,7 @@ fn main() -> Result<(), slint::PlatformError> {
 
         // Success!
         if let Some(app) = app_weak.upgrade() {
-            app.set_status_message(format!("Exported to {}", output_dir.display()).into());
+            app.set_status_message(format!("Exported to {}", project_dir.display()).into());
         }
     });
 
@@ -1155,6 +1252,15 @@ fn main() -> Result<(), slint::PlatformError> {
                     // Invalidate waveform cache since track numbers changed
                     state.waveform_cache.clear();
                     state.displayed_track_num = None;
+
+                    // Auto-save project
+                    if let Some(ref path) = state.project_path {
+                        if let Some(ref project) = state.project {
+                            if let Err(e) = project.save_to(path) {
+                                eprintln!("Auto-save failed: {}", e);
+                            }
+                        }
+                    }
                     true
                 } else {
                     false
@@ -1223,6 +1329,14 @@ fn main() -> Result<(), slint::PlatformError> {
                         let model = Rc::new(slint::VecModel::from(tracks));
                         app.set_tracks(model.into());
                     }
+                    // Auto-save project
+                    if let Some(ref path) = state.project_path {
+                        if let Some(ref project) = state.project {
+                            if let Err(e) = project.save_to(path) {
+                                eprintln!("Auto-save failed: {}", e);
+                            }
+                        }
+                    }
                 }
             }
         }
@@ -1277,6 +1391,15 @@ fn main() -> Result<(), slint::PlatformError> {
             state.waveform_cache.clear();
             state.displayed_track_num = None;
 
+            // Auto-save project
+            if let Some(ref path) = state.project_path {
+                if let Some(ref project) = state.project {
+                    if let Err(e) = project.save_to(path) {
+                        eprintln!("Auto-save failed: {}", e);
+                    }
+                }
+            }
+
             (tracks, track_num)
         };
 
@@ -1326,6 +1449,23 @@ fn main() -> Result<(), slint::PlatformError> {
             return;
         }
 
+        // Get project_dir for transcoded output
+        let project_dir = match state.project.as_ref().and_then(|p| p.project_dir.as_ref()) {
+            Some(dir) => dir.clone(),
+            None => {
+                if let Some(app) = app_weak.upgrade() {
+                    app.set_status_message("No project directory - create a project first".into());
+                    app.set_show_transcode_dialog(false);
+                }
+                return;
+            }
+        };
+
+        // Get current track count for numbering
+        let starting_track_num = state.project.as_ref()
+            .map(|p| p.album.track_count())
+            .unwrap_or(0);
+
         if let Some(app) = app_weak.upgrade() {
             app.set_is_transcoding(true);
             app.set_transcode_progress(0.0);
@@ -1339,17 +1479,28 @@ fn main() -> Result<(), slint::PlatformError> {
         // Spawn background thread for transcoding
         std::thread::spawn(move || {
             let total = pending_files.len();
+            // Store: (relative_path, title, duration)
             let mut converted_paths: Vec<(PathBuf, std::time::Duration)> = Vec::new();
+
+            // Create _transcoded directory in project
+            let transcoded_dir = project_dir.join("_transcoded");
+            if !transcoded_dir.exists() {
+                if let Err(e) = std::fs::create_dir_all(&transcoded_dir) {
+                    eprintln!("Failed to create _transcoded directory: {}", e);
+                    done_for_thread.store(true, std::sync::atomic::Ordering::SeqCst);
+                    return;
+                }
+            }
 
             for (i, (input_path, _info)) in pending_files.into_iter().enumerate() {
                 // Update progress in UI
-                let filename = input_path.file_name()
+                let title = input_path.file_stem()
                     .and_then(|s| s.to_str())
                     .unwrap_or("file")
                     .to_string();
 
                 let progress = i as f32 / total as f32;
-                let status = format!("Converting {}...", filename);
+                let status = format!("Converting {}...", title);
 
                 // Update UI from main thread
                 let app_weak_status = app_weak_clone.clone();
@@ -1360,25 +1511,25 @@ fn main() -> Result<(), slint::PlatformError> {
                     }
                 });
 
-                // Create output path in _converted subdirectory
-                let parent = input_path.parent().unwrap_or(std::path::Path::new("."));
-                let converted_dir = parent.join("_converted");
-                if !converted_dir.exists() {
-                    if let Err(e) = std::fs::create_dir_all(&converted_dir) {
-                        eprintln!("Failed to create _converted directory: {}", e);
-                        continue;
-                    }
-                }
-
-                let output_filename = input_path.file_name().unwrap_or_default();
-                let output_path = converted_dir.join(output_filename);
+                // Create numbered output filename
+                let track_num = starting_track_num + i + 1;
+                let sanitized = title.chars()
+                    .map(|c| if c.is_alphanumeric() || c == '-' || c == '_' || c == ' ' { c } else { '_' })
+                    .collect::<String>()
+                    .trim()
+                    .replace(' ', "_")
+                    .to_lowercase();
+                let output_filename = format!("{:02}_{}.wav", track_num, sanitized);
+                let output_path = transcoded_dir.join(&output_filename);
 
                 // Perform conversion
                 match convert_to_red_book(&input_path, &output_path) {
                     Ok(_) => {
                         // Read the converted file to get duration
                         if let Ok(info) = read_wav_info(&output_path) {
-                            converted_paths.push((output_path, info.duration));
+                            // Store RELATIVE path (relative to project_dir)
+                            let relative_path = PathBuf::from("_transcoded").join(&output_filename);
+                            converted_paths.push((relative_path, info.duration));
                         }
                     }
                     Err(e) => {
@@ -1444,37 +1595,50 @@ fn main() -> Result<(), slint::PlatformError> {
                     if let Some(app) = app_weak.upgrade() {
                         let mut state = state_for_timer.borrow_mut();
 
-                        // Ensure project exists
-                        if state.project.is_none() {
-                            state.new_project();
+                        if let Some(project) = state.project.as_mut() {
+                            let mut added = 0;
+
+                            for (relative_path, duration) in converted_paths {
+                                // Extract title from filename (relative_path is like "_transcoded/01_song.wav")
+                                let title = relative_path.file_stem()
+                                    .and_then(|s| s.to_str())
+                                    .unwrap_or("Unknown")
+                                    .to_string();
+
+                                // Remove track number prefix from title if present (e.g., "01_song" -> "song")
+                                let title = if title.len() > 3 && title.chars().take(2).all(|c| c.is_ascii_digit()) && title.chars().nth(2) == Some('_') {
+                                    title[3..].to_string()
+                                } else {
+                                    title
+                                };
+
+                                let track = Track::new(
+                                    (project.album.track_count() + 1) as u8,
+                                    title,
+                                    relative_path,  // Already relative path
+                                    duration,
+                                );
+                                project.album.add_track(track);
+                                added += 1;
+                            }
+
+                            // Auto-save project
+                            if let Some(ref path) = state.project_path {
+                                if let Some(ref project) = state.project {
+                                    if let Err(e) = project.save_to(path) {
+                                        eprintln!("Auto-save failed: {}", e);
+                                    }
+                                }
+                            }
+
+                            // Update UI
+                            let tracks: Vec<TrackData> = state.tracks_to_model();
+                            let model = Rc::new(slint::VecModel::from(tracks));
+                            app.set_tracks(model.into());
+                            app.set_show_transcode_dialog(false);
+                            app.set_is_transcoding(false);
+                            app.set_status_message(format!("Converted and added {} track(s)", added).into());
                         }
-
-                        let project = state.project.as_mut().unwrap();
-                        let mut added = 0;
-
-                        for (path, duration) in converted_paths {
-                            let title = path.file_stem()
-                                .and_then(|s| s.to_str())
-                                .unwrap_or("Unknown")
-                                .to_string();
-
-                            let track = Track::new(
-                                (project.album.track_count() + 1) as u8,
-                                title,
-                                path,
-                                duration,
-                            );
-                            project.album.add_track(track);
-                            added += 1;
-                        }
-
-                        // Update UI
-                        let tracks: Vec<TrackData> = state.tracks_to_model();
-                        let model = Rc::new(slint::VecModel::from(tracks));
-                        app.set_tracks(model.into());
-                        app.set_show_transcode_dialog(false);
-                        app.set_is_transcoding(false);
-                        app.set_status_message(format!("Converted and added {} track(s)", added).into());
                     }
                 }
             }
