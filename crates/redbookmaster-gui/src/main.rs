@@ -27,6 +27,13 @@ slint::include_modules!();
 /// Number of waveform peaks to display
 const WAVEFORM_BINS: usize = 500;
 
+/// Show an error dialog with the given title and message
+fn show_error_dialog(app: &MainWindow, title: &str, message: &str) {
+    app.set_error_title(title.into());
+    app.set_error_message(message.into());
+    app.set_show_error_dialog(true);
+}
+
 /// User preferences that persist between sessions
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 struct Preferences {
@@ -412,9 +419,7 @@ fn main() -> Result<(), slint::PlatformError> {
                 Err(e) => {
                     eprintln!("Failed to open project: {}", e);
                     if let Some(app) = app_weak.upgrade() {
-                        app.set_error_title("Open Failed".into());
-                        app.set_error_message(format!("Failed to open project:\n{}", e).into());
-                        app.set_show_error_dialog(true);
+                        show_error_dialog(&app, "Open Failed", &format!("Failed to open project:\n{}", e));
                     }
                 }
             }
@@ -1005,9 +1010,7 @@ fn main() -> Result<(), slint::PlatformError> {
             let state = state_clone.borrow();
             let Some(ref project) = state.project else {
                 if let Some(app) = app_weak.upgrade() {
-                    app.set_error_title("Export Error".into());
-                    app.set_error_message("No project to export. Create or open a project first.".into());
-                    app.set_show_error_dialog(true);
+                    show_error_dialog(&app, "Export Error", "No project to export. Create or open a project first.");
                 }
                 return;
             };
@@ -1015,18 +1018,14 @@ fn main() -> Result<(), slint::PlatformError> {
             // Require project directory
             let Some(ref project_dir) = project.project_dir else {
                 if let Some(app) = app_weak.upgrade() {
-                    app.set_error_title("Export Error".into());
-                    app.set_error_message("No project directory. Save the project first.".into());
-                    app.set_show_error_dialog(true);
+                    show_error_dialog(&app, "Export Error", "No project directory. Save the project first.");
                 }
                 return;
             };
 
             if project.album.tracks.is_empty() {
                 if let Some(app) = app_weak.upgrade() {
-                    app.set_error_title("Export Error".into());
-                    app.set_error_message("No tracks to export. Add some tracks first.".into());
-                    app.set_show_error_dialog(true);
+                    show_error_dialog(&app, "Export Error", "No tracks to export. Add some tracks first.");
                 }
                 return;
             }
@@ -1034,9 +1033,7 @@ fn main() -> Result<(), slint::PlatformError> {
             // Validate album
             if let Err(e) = project.album.validate() {
                 if let Some(app) = app_weak.upgrade() {
-                    app.set_error_title("Validation Error".into());
-                    app.set_error_message(format!("{}", e).into());
-                    app.set_show_error_dialog(true);
+                    show_error_dialog(&app, "Validation Error", &format!("{}", e));
                 }
                 return;
             }
@@ -1181,9 +1178,7 @@ fn main() -> Result<(), slint::PlatformError> {
         // Check if cdrdao is available
         if !cdrdao_available() {
             if let Some(app) = app_weak.upgrade() {
-                app.set_error_title("cdrdao Not Found".into());
-                app.set_error_message("cdrdao is required for CD burning.\n\nInstall it with: brew install cdrdao".into());
-                app.set_show_error_dialog(true);
+                show_error_dialog(&app, "cdrdao Not Found", "cdrdao is required for CD burning.\n\nInstall it with: brew install cdrdao");
             }
             return;
         }
@@ -1191,18 +1186,14 @@ fn main() -> Result<(), slint::PlatformError> {
         let state = state_clone.borrow();
         let Some(ref project) = state.project else {
             if let Some(app) = app_weak.upgrade() {
-                app.set_error_title("Burn Error".into());
-                app.set_error_message("No project loaded. Create or open a project first.".into());
-                app.set_show_error_dialog(true);
+                show_error_dialog(&app, "Burn Error", "No project loaded. Create or open a project first.");
             }
             return;
         };
 
         if project.album.tracks.is_empty() {
             if let Some(app) = app_weak.upgrade() {
-                app.set_error_title("Burn Error".into());
-                app.set_error_message("No tracks to burn. Add some tracks first.".into());
-                app.set_show_error_dialog(true);
+                show_error_dialog(&app, "Burn Error", "No tracks to burn. Add some tracks first.");
             }
             return;
         }
@@ -1215,9 +1206,7 @@ fn main() -> Result<(), slint::PlatformError> {
 
         if !toc_exists {
             if let Some(app) = app_weak.upgrade() {
-                app.set_error_title("Export Required".into());
-                app.set_error_message("Please export the project first to generate the TOC file needed for burning.".into());
-                app.set_show_error_dialog(true);
+                show_error_dialog(&app, "Export Required", "Please export the project first to generate the TOC file needed for burning.");
             }
             return;
         }
@@ -1699,9 +1688,7 @@ fn main() -> Result<(), slint::PlatformError> {
                 }
                 Err(e) => {
                     if let Some(app) = app_weak.upgrade() {
-                        app.set_error_title("Save Failed".into());
-                        app.set_error_message(format!("Failed to save project:\n{}", e).into());
-                        app.set_show_error_dialog(true);
+                        show_error_dialog(&app, "Save Failed", &format!("Failed to save project:\n{}", e));
                     }
                 }
             }
