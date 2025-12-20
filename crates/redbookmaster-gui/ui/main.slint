@@ -264,6 +264,13 @@ export component MainWindow inherits Window {
     in property <string> error-message: "";
     callback dismiss-error();
 
+    // Warning dialog state (for CD-TEXT validation etc.)
+    in property <bool> show-warning-dialog: false;
+    in property <string> warning-title: "Warning";
+    in property <string> warning-message: "";
+    callback warning-proceed();  // User chose to proceed anyway
+    callback warning-cancel();   // User chose to cancel
+
     // Burn dialog state
     in property <bool> show-burn-dialog: false;
     in property <[CdDriveInfo]> burn-available-drives: [];
@@ -1536,6 +1543,128 @@ export component MainWindow inherits Window {
 
                         Text {
                             text: "OK";
+                            color: Theme.text-primary;
+                            font-size: 14px;
+                            font-weight: 600;
+                            horizontal-alignment: center;
+                            vertical-alignment: center;
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    // Warning dialog overlay (for CD-TEXT validation etc.)
+    if root.show-warning-dialog: Rectangle {
+        x: 0;
+        y: 0;
+        width: 100%;
+        height: 100%;
+        background: #000000aa;
+
+        // Block clicks on background
+        TouchArea {}
+
+        // Dialog panel
+        Rectangle {
+            width: 450px;
+            height: 280px;
+            x: (parent.width - self.width) / 2;
+            y: (parent.height - self.height) / 2;
+            background: Theme.panel-background;
+            border-radius: 12px;
+            border-width: 1px;
+            border-color: Theme.panel-border;
+
+            VerticalLayout {
+                padding: 24px;
+                spacing: 16px;
+
+                // Warning icon and title
+                HorizontalLayout {
+                    spacing: 12px;
+                    alignment: center;
+
+                    Text {
+                        text: "⚠";
+                        color: #ffcc00;
+                        font-size: 24px;
+                    }
+                    Text {
+                        text: root.warning-title;
+                        color: Theme.text-primary;
+                        font-size: 18px;
+                        font-weight: 600;
+                    }
+                }
+
+                // Warning message (scrollable for long content)
+                Rectangle {
+                    background: Theme.input-background;
+                    border-radius: 6px;
+                    height: 120px;
+
+                    ScrollView {
+                        VerticalLayout {
+                            padding: 12px;
+
+                            Text {
+                                text: root.warning-message;
+                                color: Theme.text-secondary;
+                                font-size: 13px;
+                                wrap: word-wrap;
+                            }
+                        }
+                    }
+                }
+
+                // Spacer
+                Rectangle {
+                    vertical-stretch: 1;
+                }
+
+                // Buttons
+                HorizontalLayout {
+                    alignment: center;
+                    spacing: 16px;
+
+                    // Cancel button
+                    Rectangle {
+                        width: 100px;
+                        height: 36px;
+                        border-radius: 6px;
+                        border-width: 1px;
+                        border-color: Theme.panel-border;
+                        background: cancel-warn-touch.has-hover ? Theme.input-background : Theme.panel-background;
+
+                        cancel-warn-touch := TouchArea {
+                            clicked => { root.warning-cancel(); }
+                        }
+
+                        Text {
+                            text: "Cancel";
+                            color: Theme.text-primary;
+                            font-size: 14px;
+                            font-weight: 600;
+                            horizontal-alignment: center;
+                            vertical-alignment: center;
+                        }
+                    }
+
+                    // Proceed button
+                    Rectangle {
+                        width: 140px;
+                        height: 36px;
+                        border-radius: 6px;
+                        background: proceed-touch.has-hover ? Theme.accent-hover : Theme.accent;
+
+                        proceed-touch := TouchArea {
+                            clicked => { root.warning-proceed(); }
+                        }
+
+                        Text {
+                            text: "Proceed Anyway";
                             color: Theme.text-primary;
                             font-size: 14px;
                             font-weight: 600;

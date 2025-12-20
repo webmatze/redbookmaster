@@ -2,4 +2,4 @@ pub mod cue;
 pub mod toc;
 
 pub use cue::generate_cue;
-pub use toc::generate_toc;
+pub use toc::{generate_toc, validate_cd_text, CdTextValidation, CdTextWarning};

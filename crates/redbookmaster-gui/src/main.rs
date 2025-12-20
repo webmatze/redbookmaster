@@ -15,7 +15,7 @@ use redbookmaster_lib::core::track::format_duration_ms;
 use redbookmaster_lib::audio::concat::concatenate_tracks;
 use redbookmaster_lib::audio::convert::convert_to_red_book;
 use redbookmaster_lib::audio::wav::{read_wav_info, WavInfo};
-use redbookmaster_lib::{generate_cue, generate_toc};
+use redbookmaster_lib::{generate_cue, generate_toc, validate_cd_text};
 use redbookmaster_lib::{cdrdao_available, list_drives};
 use slint::Model;
 use serde::{Deserialize, Serialize};
@@ -67,6 +67,14 @@ impl Preferences {
     }
 }
 
+/// Action pending after a warning dialog is confirmed
+#[derive(Debug, Clone, PartialEq)]
+enum PendingWarningAction {
+    None,
+    Export,
+    Burn,
+}
+
 /// Application state
 struct AppState {
     project: Option<Project>,
@@ -87,6 +95,10 @@ struct AppState {
     preferences: Preferences,
     /// Last saved window size (for change detection)
     last_saved_window_size: Option<(u32, u32)>,
+    /// Action pending after warning dialog is confirmed
+    pending_warning_action: PendingWarningAction,
+    /// Skip CD-TEXT validation (set after user confirms warning)
+    skip_cd_text_validation: bool,
 }
 
 /// Cached waveform data
@@ -115,6 +127,8 @@ impl AppState {
             pending_transcode_files: Vec::new(),
             preferences: prefs,
             last_saved_window_size: last_size,
+            pending_warning_action: PendingWarningAction::None,
+            skip_cd_text_validation: false,
         }
     }
 
@@ -1004,44 +1018,69 @@ fn main() -> Result<(), slint::PlatformError> {
     let state_clone = state.clone();
     let app_weak = app.as_weak();
     app.on_export_master(move || {
-        let state = state_clone.borrow();
-        let Some(ref project) = state.project else {
-            if let Some(app) = app_weak.upgrade() {
-                app.set_error_title("Export Error".into());
-                app.set_error_message("No project to export. Create or open a project first.".into());
-                app.set_show_error_dialog(true);
+        // Gather all data we need in a scope, then release the borrow
+        let (project_dir, album, skip_validation) = {
+            let state = state_clone.borrow();
+            let Some(ref project) = state.project else {
+                if let Some(app) = app_weak.upgrade() {
+                    app.set_error_title("Export Error".into());
+                    app.set_error_message("No project to export. Create or open a project first.".into());
+                    app.set_show_error_dialog(true);
+                }
+                return;
+            };
+
+            // Require project directory
+            let Some(ref project_dir) = project.project_dir else {
+                if let Some(app) = app_weak.upgrade() {
+                    app.set_error_title("Export Error".into());
+                    app.set_error_message("No project directory. Save the project first.".into());
+                    app.set_show_error_dialog(true);
+                }
+                return;
+            };
+
+            if project.album.tracks.is_empty() {
+                if let Some(app) = app_weak.upgrade() {
+                    app.set_error_title("Export Error".into());
+                    app.set_error_message("No tracks to export. Add some tracks first.".into());
+                    app.set_show_error_dialog(true);
+                }
+                return;
             }
-            return;
+
+            // Validate album
+            if let Err(e) = project.album.validate() {
+                if let Some(app) = app_weak.upgrade() {
+                    app.set_error_title("Validation Error".into());
+                    app.set_error_message(format!("{}", e).into());
+                    app.set_show_error_dialog(true);
+                }
+                return;
+            }
+
+            (project_dir.clone(), project.album.clone(), state.skip_cd_text_validation)
         };
 
-        // Require project directory
-        let Some(ref project_dir) = project.project_dir else {
-            if let Some(app) = app_weak.upgrade() {
-                app.set_error_title("Export Error".into());
-                app.set_error_message("No project directory. Save the project first.".into());
-                app.set_show_error_dialog(true);
+        // Validate CD-TEXT for compatibility issues (unless user already confirmed)
+        if !skip_validation {
+            let cd_text_validation = validate_cd_text(&album);
+            if cd_text_validation.has_warnings() {
+                // Store pending action and show warning
+                state_clone.borrow_mut().pending_warning_action = PendingWarningAction::Export;
+                if let Some(app) = app_weak.upgrade() {
+                    app.set_warning_title("CD-TEXT Warning".into());
+                    app.set_warning_message(format!(
+                        "Some metadata may cause CD-TEXT issues:\n\n{}",
+                        cd_text_validation.format_warnings()
+                    ).into());
+                    app.set_show_warning_dialog(true);
+                }
+                return;
             }
-            return;
-        };
-
-        if project.album.tracks.is_empty() {
-            if let Some(app) = app_weak.upgrade() {
-                app.set_error_title("Export Error".into());
-                app.set_error_message("No tracks to export. Add some tracks first.".into());
-                app.set_show_error_dialog(true);
-            }
-            return;
         }
-
-        // Validate album
-        if let Err(e) = project.album.validate() {
-            if let Some(app) = app_weak.upgrade() {
-                app.set_error_title("Validation Error".into());
-                app.set_error_message(format!("{}", e).into());
-                app.set_show_error_dialog(true);
-            }
-            return;
-        }
+        // Reset skip flag for next time
+        state_clone.borrow_mut().skip_cd_text_validation = false;
 
         // Export directly to project_dir (which is {name}_rbm/)
         if let Some(app) = app_weak.upgrade() {
@@ -1049,7 +1088,7 @@ fn main() -> Result<(), slint::PlatformError> {
         }
 
         // Generate filenames based on album title
-        let base_name = project.album.title.replace(|c: char| !c.is_alphanumeric() && c != ' ', "")
+        let base_name = album.title.replace(|c: char| !c.is_alphanumeric() && c != ' ', "")
             .replace(' ', "_")
             .to_lowercase();
         let base_name = if base_name.is_empty() { "master".to_string() } else { base_name };
@@ -1065,9 +1104,9 @@ fn main() -> Result<(), slint::PlatformError> {
         }
 
         // Create tracks with resolved paths for concatenation
-        let resolved_tracks: Vec<Track> = project.album.tracks.iter().map(|t| {
+        let resolved_tracks: Vec<Track> = album.tracks.iter().map(|t| {
             let mut resolved = t.clone();
-            resolved.source_file = t.resolve_source_file(project_dir);
+            resolved.source_file = t.resolve_source_file(&project_dir);
             resolved
         }).collect();
 
@@ -1086,7 +1125,7 @@ fn main() -> Result<(), slint::PlatformError> {
         }
 
         let wav_filename = wav_path.file_name().unwrap().to_str().unwrap();
-        if let Err(e) = generate_cue(&project.album, wav_filename, &cue_path) {
+        if let Err(e) = generate_cue(&album, wav_filename, &cue_path) {
             if let Some(app) = app_weak.upgrade() {
                 app.set_error_title("Export Failed".into());
                 app.set_error_message(format!("Failed to generate CUE sheet: {}", e).into());
@@ -1100,7 +1139,7 @@ fn main() -> Result<(), slint::PlatformError> {
             app.set_status_message("Generating TOC file...".into());
         }
 
-        if let Err(e) = generate_toc(&project.album, wav_filename, &toc_path) {
+        if let Err(e) = generate_toc(&album, wav_filename, &toc_path) {
             if let Some(app) = app_weak.upgrade() {
                 app.set_error_title("Export Failed".into());
                 app.set_error_message(format!("Failed to generate TOC file: {}", e).into());
@@ -1356,6 +1395,34 @@ fn main() -> Result<(), slint::PlatformError> {
             }
             return;
         }
+
+        // Validate CD-TEXT if enabled (unless user already confirmed warning)
+        if cd_text && !state_clone.borrow().skip_cd_text_validation {
+            let validation = {
+                let state = state_clone.borrow();
+                if let Some(ref project) = state.project {
+                    validate_cd_text(&project.album)
+                } else {
+                    return;
+                }
+            };
+
+            if validation.has_warnings() {
+                // Store pending action and show warning
+                state_clone.borrow_mut().pending_warning_action = PendingWarningAction::Burn;
+                if let Some(app) = app_weak.upgrade() {
+                    app.set_warning_title("CD-TEXT Warning".into());
+                    app.set_warning_message(format!(
+                        "Some metadata may cause CD-TEXT issues:\n\n{}",
+                        validation.format_warnings()
+                    ).into());
+                    app.set_show_warning_dialog(true);
+                }
+                return;
+            }
+        }
+        // Reset skip flag
+        state_clone.borrow_mut().skip_cd_text_validation = false;
 
         // Reset burn state
         if let Ok(mut log) = burn_log_clone.lock() {
@@ -1814,6 +1881,49 @@ fn main() -> Result<(), slint::PlatformError> {
     app.on_dismiss_error(move || {
         if let Some(app) = app_weak.upgrade() {
             app.set_show_error_dialog(false);
+        }
+    });
+
+    // Warning dialog - user chose to proceed anyway
+    let state_clone = state.clone();
+    let app_weak = app.as_weak();
+    app.on_warning_proceed(move || {
+        let pending_action = {
+            let mut state = state_clone.borrow_mut();
+            state.skip_cd_text_validation = true;
+            std::mem::replace(&mut state.pending_warning_action, PendingWarningAction::None)
+        };
+
+        if let Some(app) = app_weak.upgrade() {
+            app.set_show_warning_dialog(false);
+
+            match pending_action {
+                PendingWarningAction::Export => {
+                    // Invoke export callback again (validation will be skipped)
+                    app.invoke_export_master();
+                }
+                PendingWarningAction::Burn => {
+                    // Invoke burn callback again (for future burn validation)
+                    app.invoke_start_burn();
+                }
+                PendingWarningAction::None => {}
+            }
+        }
+    });
+
+    // Warning dialog - user chose to cancel
+    let state_clone = state.clone();
+    let app_weak = app.as_weak();
+    app.on_warning_cancel(move || {
+        {
+            let mut state = state_clone.borrow_mut();
+            state.pending_warning_action = PendingWarningAction::None;
+            state.skip_cd_text_validation = false;
+        }
+
+        if let Some(app) = app_weak.upgrade() {
+            app.set_show_warning_dialog(false);
+            app.set_status_message("Operation cancelled".into());
         }
     });
 

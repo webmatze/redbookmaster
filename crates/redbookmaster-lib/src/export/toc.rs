@@ -131,6 +131,93 @@ pub enum TocError {
     IoError(#[from] std::io::Error),
 }
 
+/// CD-TEXT field length limit (Red Book specification)
+const CD_TEXT_MAX_LENGTH: usize = 80;
+
+/// A single CD-TEXT validation warning
+#[derive(Debug, Clone)]
+pub struct CdTextWarning {
+    /// Which field has the issue (e.g., "Album title", "Track 3 title")
+    pub field: String,
+    /// Description of the issue
+    pub message: String,
+}
+
+/// Result of CD-TEXT validation
+#[derive(Debug, Clone, Default)]
+pub struct CdTextValidation {
+    pub warnings: Vec<CdTextWarning>,
+}
+
+impl CdTextValidation {
+    /// Check if there are any warnings
+    pub fn has_warnings(&self) -> bool {
+        !self.warnings.is_empty()
+    }
+
+    /// Format warnings as a human-readable string
+    pub fn format_warnings(&self) -> String {
+        self.warnings
+            .iter()
+            .map(|w| format!("• {}: {}", w.field, w.message))
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+}
+
+/// Validate CD-TEXT metadata for an album
+/// Returns warnings for non-ASCII characters and overly long strings
+pub fn validate_cd_text(album: &Album) -> CdTextValidation {
+    let mut validation = CdTextValidation::default();
+
+    // Validate album-level fields
+    validate_string(&album.title, "Album title", &mut validation);
+    validate_string(&album.performer, "Album performer", &mut validation);
+    if let Some(ref songwriter) = album.songwriter {
+        validate_string(songwriter, "Album songwriter", &mut validation);
+    }
+
+    // Validate track-level fields
+    for track in &album.tracks {
+        let track_prefix = format!("Track {}", track.number);
+        validate_string(&track.title, &format!("{} title", track_prefix), &mut validation);
+        if let Some(ref performer) = track.performer {
+            validate_string(performer, &format!("{} performer", track_prefix), &mut validation);
+        }
+        if let Some(ref songwriter) = track.songwriter {
+            validate_string(songwriter, &format!("{} songwriter", track_prefix), &mut validation);
+        }
+    }
+
+    validation
+}
+
+/// Validate a single string field for CD-TEXT compatibility
+fn validate_string(value: &str, field_name: &str, validation: &mut CdTextValidation) {
+    if value.is_empty() {
+        return;
+    }
+
+    // Check for non-ASCII characters
+    let non_ascii: Vec<char> = value.chars().filter(|c| !c.is_ascii()).collect();
+    if !non_ascii.is_empty() {
+        let chars_display: String = non_ascii.iter().take(5).collect();
+        let suffix = if non_ascii.len() > 5 { "..." } else { "" };
+        validation.warnings.push(CdTextWarning {
+            field: field_name.to_string(),
+            message: format!("Contains non-ASCII characters: \"{}{}\"", chars_display, suffix),
+        });
+    }
+
+    // Check length
+    if value.len() > CD_TEXT_MAX_LENGTH {
+        validation.warnings.push(CdTextWarning {
+            field: field_name.to_string(),
+            message: format!("Exceeds {} characters ({} chars, will be truncated)", CD_TEXT_MAX_LENGTH, value.len()),
+        });
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -140,5 +227,42 @@ mod tests {
         assert_eq!(escape_toc_string("Hello World"), "Hello World");
         assert_eq!(escape_toc_string("Say \"Hi\""), "Say \\\"Hi\\\"");
         assert_eq!(escape_toc_string("Back\\slash"), "Back\\\\slash");
+    }
+
+    #[test]
+    fn test_validate_cd_text_ascii() {
+        let album = Album {
+            title: "My Album".to_string(),
+            performer: "Artist Name".to_string(),
+            ..Default::default()
+        };
+        let validation = validate_cd_text(&album);
+        assert!(!validation.has_warnings());
+    }
+
+    #[test]
+    fn test_validate_cd_text_non_ascii() {
+        let album = Album {
+            title: "Müsic Ålbüm".to_string(),
+            performer: "Artïst".to_string(),
+            ..Default::default()
+        };
+        let validation = validate_cd_text(&album);
+        assert!(validation.has_warnings());
+        assert_eq!(validation.warnings.len(), 2);
+        assert!(validation.warnings[0].message.contains("non-ASCII"));
+    }
+
+    #[test]
+    fn test_validate_cd_text_too_long() {
+        let album = Album {
+            title: "A".repeat(100),  // 100 chars, exceeds 80
+            performer: "Normal".to_string(),
+            ..Default::default()
+        };
+        let validation = validate_cd_text(&album);
+        assert!(validation.has_warnings());
+        assert_eq!(validation.warnings.len(), 1);
+        assert!(validation.warnings[0].message.contains("Exceeds"));
     }
 }
