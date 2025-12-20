@@ -1082,11 +1082,6 @@ fn main() -> Result<(), slint::PlatformError> {
         // Reset skip flag for next time
         state_clone.borrow_mut().skip_cd_text_validation = false;
 
-        // Export directly to project_dir (which is {name}_rbm/)
-        if let Some(app) = app_weak.upgrade() {
-            app.set_status_message("Exporting...".into());
-        }
-
         // Generate filenames based on album title
         let base_name = album.title.replace(|c: char| !c.is_alphanumeric() && c != ' ', "")
             .replace(' ', "_")
@@ -1097,61 +1092,107 @@ fn main() -> Result<(), slint::PlatformError> {
         let cue_path = project_dir.join(format!("{}.cue", base_name));
         let toc_path = project_dir.join(format!("{}.toc", base_name));
 
-        // Step 1: Concatenate tracks into master WAV
-        // Resolve relative paths for concatenation
-        if let Some(app) = app_weak.upgrade() {
-            app.set_status_message("Creating master WAV file...".into());
-        }
-
-        // Create tracks with resolved paths for concatenation
+        // Create tracks with resolved paths for concatenation (before spawning thread)
         let resolved_tracks: Vec<Track> = album.tracks.iter().map(|t| {
             let mut resolved = t.clone();
             resolved.source_file = t.resolve_source_file(&project_dir);
             resolved
         }).collect();
 
-        if let Err(e) = concatenate_tracks(&resolved_tracks, &wav_path) {
-            if let Some(app) = app_weak.upgrade() {
-                app.set_error_title("Export Failed".into());
-                app.set_error_message(format!("Failed to create master WAV: {}", e).into());
-                app.set_show_error_dialog(true);
-            }
-            return;
-        }
-
-        // Step 2: Generate CUE sheet
+        // Show export dialog immediately
         if let Some(app) = app_weak.upgrade() {
-            app.set_status_message("Generating CUE sheet...".into());
+            app.set_show_export_dialog(true);
+            app.set_is_exporting(true);
+            app.set_export_complete(false);
+            app.set_export_error(false);
+            app.set_export_status("Creating master WAV file...".into());
+            app.set_export_output_dir(project_dir.display().to_string().into());
+            app.set_status_message("Exporting...".into());
         }
 
-        let wav_filename = wav_path.file_name().unwrap().to_str().unwrap();
-        if let Err(e) = generate_cue(&album, wav_filename, &cue_path) {
-            if let Some(app) = app_weak.upgrade() {
-                app.set_error_title("Export Failed".into());
-                app.set_error_message(format!("Failed to generate CUE sheet: {}", e).into());
-                app.set_show_error_dialog(true);
+        // Spawn background thread for export work
+        let app_weak_thread = app_weak.clone();
+        let album_for_thread = album.clone();
+        let project_dir_for_status = project_dir.clone();
+        std::thread::spawn(move || {
+            // Step 1: Concatenate tracks into master WAV
+            if let Err(e) = concatenate_tracks(&resolved_tracks, &wav_path) {
+                let error_msg = format!("Failed to create master WAV: {}", e);
+                let _ = slint::invoke_from_event_loop(move || {
+                    if let Some(app) = app_weak_thread.upgrade() {
+                        app.set_is_exporting(false);
+                        app.set_export_error(true);
+                        app.set_export_error_message(error_msg.into());
+                    }
+                });
+                return;
             }
-            return;
-        }
 
-        // Step 3: Generate TOC file for cdrdao
-        if let Some(app) = app_weak.upgrade() {
-            app.set_status_message("Generating TOC file...".into());
-        }
+            // Step 2: Generate CUE sheet
+            let app_weak_step2 = app_weak_thread.clone();
+            let _ = slint::invoke_from_event_loop(move || {
+                if let Some(app) = app_weak_step2.upgrade() {
+                    app.set_export_status("Generating CUE sheet...".into());
+                }
+            });
 
-        if let Err(e) = generate_toc(&album, wav_filename, &toc_path) {
-            if let Some(app) = app_weak.upgrade() {
-                app.set_error_title("Export Failed".into());
-                app.set_error_message(format!("Failed to generate TOC file: {}", e).into());
-                app.set_show_error_dialog(true);
+            let wav_filename = wav_path.file_name().unwrap().to_str().unwrap().to_string();
+            if let Err(e) = generate_cue(&album_for_thread, &wav_filename, &cue_path) {
+                let error_msg = format!("Failed to generate CUE sheet: {}", e);
+                let _ = slint::invoke_from_event_loop(move || {
+                    if let Some(app) = app_weak_thread.upgrade() {
+                        app.set_is_exporting(false);
+                        app.set_export_error(true);
+                        app.set_export_error_message(error_msg.into());
+                    }
+                });
+                return;
             }
-            return;
-        }
 
-        // Success!
-        if let Some(app) = app_weak.upgrade() {
-            app.set_status_message(format!("Exported to {}", project_dir.display()).into());
-        }
+            // Step 3: Generate TOC file for cdrdao
+            let app_weak_step3 = app_weak_thread.clone();
+            let _ = slint::invoke_from_event_loop(move || {
+                if let Some(app) = app_weak_step3.upgrade() {
+                    app.set_export_status("Generating TOC file...".into());
+                }
+            });
+
+            if let Err(e) = generate_toc(&album_for_thread, &wav_filename, &toc_path) {
+                let error_msg = format!("Failed to generate TOC file: {}", e);
+                let _ = slint::invoke_from_event_loop(move || {
+                    if let Some(app) = app_weak_thread.upgrade() {
+                        app.set_is_exporting(false);
+                        app.set_export_error(true);
+                        app.set_export_error_message(error_msg.into());
+                    }
+                });
+                return;
+            }
+
+            // Success! Show created files
+            let wav_name = wav_path.file_name().unwrap().to_str().unwrap().to_string();
+            let cue_name = cue_path.file_name().unwrap().to_str().unwrap().to_string();
+            let toc_name = toc_path.file_name().unwrap().to_str().unwrap().to_string();
+            let output_dir = project_dir_for_status.display().to_string();
+
+            let _ = slint::invoke_from_event_loop(move || {
+                if let Some(app) = app_weak_thread.upgrade() {
+                    app.set_is_exporting(false);
+                    app.set_export_complete(true);
+
+                    // Create list of created files
+                    let created_files: Vec<slint::SharedString> = vec![
+                        wav_name.into(),
+                        cue_name.into(),
+                        toc_name.into(),
+                    ];
+                    let files_model: Rc<slint::VecModel<slint::SharedString>> = Rc::new(slint::VecModel::from(created_files));
+                    app.set_export_created_files(files_model.into());
+
+                    app.set_status_message(format!("Exported to {}", output_dir).into());
+                }
+            });
+        });
     });
 
     // on_burn_cd - Opens the burn dialog
@@ -1611,6 +1652,23 @@ fn main() -> Result<(), slint::PlatformError> {
             app.set_is_burning(false);
             app.set_burn_error(true);
             app.set_burn_result_message("Burn cancelled by user.\n\nNote: The disc may be unusable.".into());
+        }
+    });
+
+    // on_close_export_dialog - Closes the export dialog and resets state
+    let app_weak = app.as_weak();
+    app.on_close_export_dialog(move || {
+        if let Some(app) = app_weak.upgrade() {
+            app.set_show_export_dialog(false);
+            app.set_is_exporting(false);
+            app.set_export_complete(false);
+            app.set_export_error(false);
+            app.set_export_status("".into());
+            app.set_export_error_message("".into());
+            app.set_export_output_dir("".into());
+            // Clear the created files list
+            let empty_files: Rc<slint::VecModel<slint::SharedString>> = Rc::new(slint::VecModel::from(Vec::new()));
+            app.set_export_created_files(empty_files.into());
         }
     });
 

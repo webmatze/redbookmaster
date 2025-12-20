@@ -271,6 +271,17 @@ export component MainWindow inherits Window {
     callback warning-proceed();  // User chose to proceed anyway
     callback warning-cancel();   // User chose to cancel
 
+    // Export dialog state
+    in property <bool> show-export-dialog: false;
+    in property <bool> is-exporting: false;
+    in property <bool> export-complete: false;
+    in property <bool> export-error: false;
+    in property <string> export-status: "";          // Current step (e.g., "Creating master WAV...")
+    in property <string> export-error-message: "";   // Error message if failed
+    in property <string> export-output-dir: "";      // Where files were saved
+    in property <[string]> export-created-files: []; // List of created files
+    callback close-export-dialog();
+
     // Burn dialog state
     in property <bool> show-burn-dialog: false;
     in property <[CdDriveInfo]> burn-available-drives: [];
@@ -1670,6 +1681,225 @@ export component MainWindow inherits Window {
                             font-weight: 600;
                             horizontal-alignment: center;
                             vertical-alignment: center;
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    // Export dialog overlay
+    if root.show-export-dialog: Rectangle {
+        x: 0;
+        y: 0;
+        width: 100%;
+        height: 100%;
+        background: #000000aa;
+
+        // Block clicks on background
+        TouchArea {}
+
+        // Dialog panel
+        Rectangle {
+            width: 450px;
+            height: root.export-complete || root.export-error ? 320px : 180px;
+            x: (parent.width - self.width) / 2;
+            y: (parent.height - self.height) / 2;
+            background: Theme.panel-background;
+            border-radius: 12px;
+            border-width: 1px;
+            border-color: Theme.panel-border;
+
+            VerticalLayout {
+                padding: 24px;
+                spacing: 16px;
+
+                // Exporting state
+                if root.is-exporting && !root.export-complete && !root.export-error: VerticalLayout {
+                    spacing: 16px;
+
+                    HorizontalLayout {
+                        spacing: 12px;
+                        alignment: center;
+
+                        Text {
+                            text: "⏳";
+                            font-size: 24px;
+                        }
+                        Text {
+                            text: "Exporting...";
+                            color: Theme.text-primary;
+                            font-size: 18px;
+                            font-weight: 600;
+                        }
+                    }
+
+                    Text {
+                        text: root.export-status;
+                        color: Theme.text-secondary;
+                        font-size: 14px;
+                        horizontal-alignment: center;
+                    }
+
+                    // Simple progress indicator
+                    Rectangle {
+                        height: 4px;
+                        background: Theme.input-background;
+                        border-radius: 2px;
+
+                        Rectangle {
+                            x: 0;
+                            y: 0;
+                            width: parent.width * 0.6;
+                            height: 100%;
+                            background: Theme.accent;
+                            border-radius: 2px;
+
+                            animate width { duration: 500ms; }
+                        }
+                    }
+                }
+
+                // Complete state
+                if root.export-complete: VerticalLayout {
+                    spacing: 16px;
+
+                    HorizontalLayout {
+                        spacing: 12px;
+                        alignment: center;
+
+                        Text {
+                            text: "✓";
+                            color: #4ade80;
+                            font-size: 28px;
+                            font-weight: 700;
+                        }
+                        Text {
+                            text: "Export Complete";
+                            color: Theme.text-primary;
+                            font-size: 18px;
+                            font-weight: 600;
+                        }
+                    }
+
+                    // Output directory
+                    Text {
+                        text: "Saved to:";
+                        color: Theme.text-secondary;
+                        font-size: 13px;
+                    }
+                    Text {
+                        text: root.export-output-dir;
+                        color: Theme.text-primary;
+                        font-size: 13px;
+                        wrap: word-wrap;
+                    }
+
+                    // Created files list
+                    Text {
+                        text: "Created files:";
+                        color: Theme.text-secondary;
+                        font-size: 13px;
+                    }
+                    Rectangle {
+                        background: Theme.input-background;
+                        border-radius: 6px;
+                        height: 80px;
+
+                        ScrollView {
+                            VerticalLayout {
+                                padding: 8px;
+                                spacing: 4px;
+
+                                for file in root.export-created-files: Text {
+                                    text: "• " + file;
+                                    color: Theme.text-primary;
+                                    font-size: 12px;
+                                }
+                            }
+                        }
+                    }
+
+                    // OK button
+                    HorizontalLayout {
+                        alignment: center;
+
+                        Rectangle {
+                            width: 100px;
+                            height: 36px;
+                            border-radius: 6px;
+                            background: export-ok-touch.has-hover ? Theme.accent-hover : Theme.accent;
+
+                            export-ok-touch := TouchArea {
+                                clicked => { root.close-export-dialog(); }
+                            }
+
+                            Text {
+                                text: "OK";
+                                color: Theme.text-primary;
+                                font-size: 14px;
+                                font-weight: 600;
+                                horizontal-alignment: center;
+                                vertical-alignment: center;
+                            }
+                        }
+                    }
+                }
+
+                // Error state
+                if root.export-error: VerticalLayout {
+                    spacing: 16px;
+
+                    HorizontalLayout {
+                        spacing: 12px;
+                        alignment: center;
+
+                        Text {
+                            text: "!";
+                            color: #ff6b6b;
+                            font-size: 28px;
+                            font-weight: 700;
+                        }
+                        Text {
+                            text: "Export Failed";
+                            color: Theme.text-primary;
+                            font-size: 18px;
+                            font-weight: 600;
+                        }
+                    }
+
+                    Text {
+                        text: root.export-error-message;
+                        color: Theme.text-secondary;
+                        font-size: 14px;
+                        horizontal-alignment: center;
+                        wrap: word-wrap;
+                    }
+
+                    Rectangle { vertical-stretch: 1; }
+
+                    // OK button
+                    HorizontalLayout {
+                        alignment: center;
+
+                        Rectangle {
+                            width: 100px;
+                            height: 36px;
+                            border-radius: 6px;
+                            background: export-err-ok-touch.has-hover ? Theme.accent-hover : Theme.accent;
+
+                            export-err-ok-touch := TouchArea {
+                                clicked => { root.close-export-dialog(); }
+                            }
+
+                            Text {
+                                text: "OK";
+                                color: Theme.text-primary;
+                                font-size: 14px;
+                                font-weight: 600;
+                                horizontal-alignment: center;
+                                vertical-alignment: center;
+                            }
                         }
                     }
                 }
