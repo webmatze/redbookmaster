@@ -25,6 +25,38 @@ export global Theme {
     out property <color> track-selected: #0066cc30;
 }
 
+// Reusable action button component
+component ActionButton inherits Rectangle {
+    in property <string> label;
+    in property <bool> enabled: true;
+    in property <bool> accent: false;
+    in property <length> button-width: 70px;
+
+    callback clicked();
+
+    width: button-width;
+    height: 28px;
+    border-radius: 4px;
+    opacity: enabled ? 1.0 : 0.4;
+    background: !enabled ? Theme.button-background :
+                touch.has-hover ? (accent ? Theme.accent-hover : Theme.button-hover) :
+                (accent ? Theme.accent : Theme.button-background);
+
+    touch := TouchArea {
+        enabled: root.enabled;
+        clicked => { root.clicked(); }
+    }
+
+    Text {
+        text: root.label;
+        color: Theme.text-primary;
+        font-size: 12px;
+        font-weight: root.accent ? 500 : 400;
+        horizontal-alignment: center;
+        vertical-alignment: center;
+    }
+}
+
 // Track data structure
 export struct TrackData {
     number: int,
@@ -405,115 +437,38 @@ export component MainWindow inherits Window {
                 spacing: 4px;
 
                 // Quick action buttons
-                new-btn := Rectangle {
-                    width: 70px;
-                    height: 28px;
-                    border-radius: 4px;
-                    background: new-touch.has-hover ? Theme.button-hover : Theme.button-background;
-
-                    new-touch := TouchArea {
-                        clicked => { root.new-project(); }
-                    }
-
-                    Text {
-                        text: "New";
-                        color: Theme.text-primary;
-                        font-size: 12px;
-                        horizontal-alignment: center;
-                        vertical-alignment: center;
-                    }
+                ActionButton {
+                    label: "New";
+                    clicked => { root.new-project(); }
                 }
 
-                open-btn := Rectangle {
-                    width: 70px;
-                    height: 28px;
-                    border-radius: 4px;
-                    background: open-touch.has-hover ? Theme.button-hover : Theme.button-background;
-
-                    open-touch := TouchArea {
-                        clicked => { root.open-project(); }
-                    }
-
-                    Text {
-                        text: "Open";
-                        color: Theme.text-primary;
-                        font-size: 12px;
-                        horizontal-alignment: center;
-                        vertical-alignment: center;
-                    }
+                ActionButton {
+                    label: "Open";
+                    clicked => { root.open-project(); }
                 }
 
-                save-btn := Rectangle {
-                    property <bool> enabled: root.has-project;
-                    width: 70px;
-                    height: 28px;
-                    border-radius: 4px;
-                    background: !enabled ? Theme.button-background :
-                                save-touch.has-hover ? Theme.button-hover : Theme.button-background;
-                    opacity: enabled ? 1.0 : 0.4;
-
-                    save-touch := TouchArea {
-                        enabled: parent.enabled;
-                        clicked => { root.save-project(); }
-                    }
-
-                    Text {
-                        text: "Save";
-                        color: Theme.text-primary;
-                        font-size: 12px;
-                        horizontal-alignment: center;
-                        vertical-alignment: center;
-                    }
+                ActionButton {
+                    label: "Save";
+                    enabled: root.has-project;
+                    clicked => { root.save-project(); }
                 }
 
                 Rectangle { width: 16px; }
 
-                export-btn := Rectangle {
-                    property <bool> enabled: root.has-project;
-                    width: 80px;
-                    height: 28px;
-                    border-radius: 4px;
-                    background: !enabled ? Theme.button-background :
-                                export-touch.has-hover ? Theme.accent-hover : Theme.accent;
-                    opacity: enabled ? 1.0 : 0.4;
-
-                    export-touch := TouchArea {
-                        enabled: parent.enabled;
-                        clicked => { root.export-master(); }
-                    }
-
-                    Text {
-                        text: "Export";
-                        color: Theme.text-primary;
-                        font-size: 12px;
-                        font-weight: 500;
-                        horizontal-alignment: center;
-                        vertical-alignment: center;
-                    }
+                ActionButton {
+                    label: "Export";
+                    enabled: root.has-project;
+                    accent: true;
+                    button-width: 80px;
+                    clicked => { root.export-master(); }
                 }
 
-                burn-btn := Rectangle {
-                    property <bool> enabled: root.has-project;
-                    width: 80px;
-                    height: 28px;
-                    border-radius: 4px;
-                    background: !enabled ? Theme.button-background :
-                                burn-touch.has-hover ? Theme.accent-hover : Theme.accent;
-                    opacity: enabled ? 1.0 : 0.4;
-
-                    burn-touch := TouchArea {
-                        enabled: parent.enabled;
-                        clicked => { root.burn-cd(); }
-                    }
-
-                    Text {
-                        text: "Burn CD";
-                        color: Theme.text-primary;
-                        font-size: 12px;
-                        font-weight: 500;
-                        horizontal-alignment: center;
-                        vertical-alignment: center;
-                    }
+                ActionButton {
+                    label: "Burn CD";
+                    enabled: root.has-project;
+                    accent: true;
+                    button-width: 80px;
+                    clicked => { root.burn-cd(); }
                 }
 
                 // Spacer to push branding to the right
