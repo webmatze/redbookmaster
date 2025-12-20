@@ -34,6 +34,14 @@ fn show_error_dialog(app: &MainWindow, title: &str, message: &str) {
     app.set_show_error_dialog(true);
 }
 
+/// Extract filename from a path, returning a fallback if extraction fails
+fn get_filename(path: &std::path::Path, fallback: &str) -> String {
+    path.file_name()
+        .and_then(|n| n.to_str())
+        .map(String::from)
+        .unwrap_or_else(|| fallback.to_string())
+}
+
 /// Unmount any mounted optical discs on macOS
 /// This is required before cdrdao can access the drive
 #[cfg(target_os = "macos")]
@@ -503,7 +511,9 @@ fn main() -> Result<(), slint::PlatformError> {
         if let Some(files) = dialog.pick_files() {
             let mut state = state_clone.borrow_mut();
 
-            let project = state.project.as_mut().unwrap();
+            let Some(project) = state.project.as_mut() else {
+                return; // Project was closed while dialog was open
+            };
             let mut added = 0;
             let mut needs_transcoding: Vec<(PathBuf, WavInfo)> = Vec::new();
 
@@ -727,7 +737,7 @@ fn main() -> Result<(), slint::PlatformError> {
                 loop {
                     // Get the pending request
                     let request = {
-                        let mut pending = pending_clone.lock().unwrap();
+                        let mut pending = pending_clone.lock().expect("waveform pending mutex poisoned");
                         pending.take()
                     };
 
@@ -742,7 +752,7 @@ fn main() -> Result<(), slint::PlatformError> {
 
                         // Check if there's a newer request - if so, discard this result
                         let has_newer_request = {
-                            let pending = pending_clone.lock().unwrap();
+                            let pending = pending_clone.lock().expect("waveform pending mutex poisoned");
                             pending.is_some()
                         };
 
@@ -756,7 +766,7 @@ fn main() -> Result<(), slint::PlatformError> {
 
                     // Check if there's another request pending
                     let has_pending = {
-                        let pending = pending_clone.lock().unwrap();
+                        let pending = pending_clone.lock().expect("waveform pending mutex poisoned");
                         pending.is_some()
                     };
 
@@ -1131,7 +1141,7 @@ fn main() -> Result<(), slint::PlatformError> {
                 }
             });
 
-            let wav_filename = wav_path.file_name().unwrap().to_str().unwrap().to_string();
+            let wav_filename = get_filename(&wav_path, "master.wav");
             if let Err(e) = generate_cue(&album_for_thread, &wav_filename, &cue_path) {
                 let error_msg = format!("Failed to generate CUE sheet: {}", e);
                 let _ = slint::invoke_from_event_loop(move || {
@@ -1165,9 +1175,9 @@ fn main() -> Result<(), slint::PlatformError> {
             }
 
             // Success! Show created files
-            let wav_name = wav_path.file_name().unwrap().to_str().unwrap().to_string();
-            let cue_name = cue_path.file_name().unwrap().to_str().unwrap().to_string();
-            let toc_name = toc_path.file_name().unwrap().to_str().unwrap().to_string();
+            let wav_name = get_filename(&wav_path, "master.wav");
+            let cue_name = get_filename(&cue_path, "master.cue");
+            let toc_name = get_filename(&toc_path, "master.toc");
             let output_dir = project_dir_for_status.display().to_string();
 
             let _ = slint::invoke_from_event_loop(move || {
@@ -1515,15 +1525,15 @@ fn main() -> Result<(), slint::PlatformError> {
             // Spawn child process
             match cmd.spawn() {
                 Ok(mut child) => {
+                    // Take stderr before storing child in mutex
+                    let stderr = child.stderr.take();
+
                     // Store child process handle for cancel support
                     if let Ok(mut guard) = burn_child_thread.lock() {
-                        *guard = Some(std::mem::replace(&mut child, std::process::Command::new("true").spawn().unwrap()));
-                        std::mem::swap(&mut child, guard.as_mut().unwrap());
+                        *guard = Some(child);
                     }
 
                     // Read stderr for progress (cdrdao outputs to stderr)
-                    let stderr = child.stderr.take();
-
                     if let Some(stderr) = stderr {
                         use std::io::BufRead;
                         let reader = std::io::BufReader::new(stderr);
@@ -1541,8 +1551,14 @@ fn main() -> Result<(), slint::PlatformError> {
                     }
 
                     // Wait for process to complete
-                    match child.wait() {
-                        Ok(status) => {
+                    let wait_result = if let Ok(mut guard) = burn_child_thread.lock() {
+                        guard.as_mut().and_then(|c| c.wait().ok())
+                    } else {
+                        None
+                    };
+
+                    match wait_result {
+                        Some(status) => {
                             if status.success() {
                                 println!("=== Burn completed successfully ===");
                                 burn_complete_thread.store(true, Ordering::SeqCst);
@@ -1554,11 +1570,11 @@ fn main() -> Result<(), slint::PlatformError> {
                                 }
                             }
                         }
-                        Err(e) => {
-                            println!("=== Failed to wait for burn process: {} ===", e);
+                        None => {
+                            println!("=== Failed to wait for burn process ===");
                             burn_error_thread.store(true, Ordering::SeqCst);
                             if let Ok(mut msg) = burn_error_msg_thread.lock() {
-                                *msg = format!("Failed to wait for burn process: {}", e);
+                                *msg = "Failed to wait for burn process".to_string();
                             }
                         }
                     }
@@ -2077,7 +2093,7 @@ fn main() -> Result<(), slint::PlatformError> {
                 done_for_timer.store(false, std::sync::atomic::Ordering::SeqCst);
 
                 let converted_paths = {
-                    let mut completed = completed_for_timer.lock().unwrap();
+                    let mut completed = completed_for_timer.lock().expect("transcode completed mutex poisoned");
                     std::mem::take(&mut *completed)
                 };
 
