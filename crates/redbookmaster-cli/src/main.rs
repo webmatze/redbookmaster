@@ -3,13 +3,9 @@ use colored::Colorize;
 use std::path::PathBuf;
 
 mod cli;
-mod core;
-mod audio;
-mod export;
-mod burn;
 
 use cli::wizard;
-use core::project::Project;
+use redbookmaster_lib::Project;
 
 #[derive(Parser)]
 #[command(name = "redbookmaster")]

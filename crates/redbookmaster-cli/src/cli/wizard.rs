@@ -2,7 +2,11 @@ use colored::Colorize;
 use inquire::{Confirm, Select, Text};
 use std::path::PathBuf;
 
-use crate::core::{Album, Project};
+use redbookmaster_lib::{Album, Project, Track, Isrc, Mcn, WavInfo, Player};
+use redbookmaster_lib::audio::{wav, concat, convert_to_red_book};
+use redbookmaster_lib::core::track::{format_duration_ms, MIN_TRACK_DURATION};
+use redbookmaster_lib::export::{cue, toc};
+use redbookmaster_lib::burn::cdrdao;
 
 /// Display the main menu when launching without arguments
 pub fn main_menu() {
@@ -80,7 +84,7 @@ pub fn new_project() {
     {
         Ok(c) if !c.trim().is_empty() => {
             // Validate MCN format
-            match crate::core::metadata::Mcn::new(c.trim()) {
+            match Mcn::new(c.trim()) {
                 Ok(mcn) => Some(mcn),
                 Err(e) => {
                     println!("{} Invalid catalog number: {}. Skipping.", "⚠".yellow(), e);
@@ -123,7 +127,7 @@ fn convert_and_add_track(
     project: &mut Project,
     source_path: &std::path::Path,
     title: &str,
-    info: &crate::audio::WavInfo,
+    info: &WavInfo,
 ) -> Result<(), String> {
     use indicatif::{ProgressBar, ProgressStyle};
 
@@ -155,7 +159,7 @@ fn convert_and_add_track(
     pb.enable_steady_tick(std::time::Duration::from_millis(100));
 
     // Perform conversion
-    let result = crate::audio::convert_to_red_book(source_path, &output_path);
+    let result = convert_to_red_book(source_path, &output_path);
 
     pb.finish_and_clear();
 
@@ -164,9 +168,9 @@ fn convert_and_add_track(
             println!("{} Conversion complete: {}", "✓".green(), conversion.summary());
 
             // Read the converted file info
-            match crate::audio::wav::read_wav_info(&output_path) {
+            match wav::read_wav_info(&output_path) {
                 Ok(new_info) => {
-                    let track = crate::core::Track::new(
+                    let track = Track::new(
                         (project.album.track_count() + 1) as u8,
                         title.to_string(),
                         output_path.clone(),
@@ -178,7 +182,7 @@ fn convert_and_add_track(
                         "{} Added: {} ({})",
                         "✓".green(),
                         title,
-                        crate::core::track::format_duration_ms(new_info.duration)
+                        format_duration_ms(new_info.duration)
                     );
                     println!("  Converted file: {:?}", output_path);
 
@@ -291,7 +295,7 @@ fn add_tracks_manually(project: &mut Project) {
 /// Process a single WAV file and add it to the project
 fn process_wav_file(project: &mut Project, path: &std::path::Path) {
     // Try to read WAV file info
-    match crate::audio::wav::read_wav_info(path) {
+    match wav::read_wav_info(path) {
         Ok(info) => {
             // Auto-generate track title from filename
             let title = path
@@ -300,7 +304,7 @@ fn process_wav_file(project: &mut Project, path: &std::path::Path) {
                 .map(|s| clean_track_title(s))
                 .unwrap_or_else(|| format!("Track {}", project.album.track_count() + 1));
 
-            let track = crate::core::Track::new(
+            let track = Track::new(
                 (project.album.track_count() + 1) as u8,
                 title.clone(),
                 path.to_path_buf(),
@@ -342,7 +346,7 @@ fn process_wav_file(project: &mut Project, path: &std::path::Path) {
                     "{} Added: {} ({})",
                     "✓".green(),
                     title,
-                    crate::core::track::format_duration_ms(info.duration)
+                    format_duration_ms(info.duration)
                 );
             }
         }
@@ -510,7 +514,7 @@ fn view_tracks(project: &Project) {
     }
 
     for track in &project.album.tracks {
-        let duration = crate::core::track::format_duration_ms(track.duration);
+        let duration = format_duration_ms(track.duration);
         let pregap = if track.pregap.as_secs() > 0 {
             format!(" [gap: {}s]", track.pregap.as_secs())
         } else {
@@ -596,7 +600,7 @@ fn edit_track_metadata(project: &mut Project) {
                 track.isrc = if new_isrc.trim().is_empty() {
                     None
                 } else {
-                    match crate::core::Isrc::new(&new_isrc) {
+                    match Isrc::new(&new_isrc) {
                         Ok(isrc) => Some(isrc),
                         Err(e) => {
                             println!("{} Invalid ISRC: {}", "⚠".yellow(), e);
@@ -655,7 +659,7 @@ fn edit_album_metadata(project: &mut Project) {
         project.album.catalog = if new_catalog.trim().is_empty() {
             None
         } else {
-            match crate::core::Mcn::new(&new_catalog) {
+            match Mcn::new(&new_catalog) {
                 Ok(mcn) => Some(mcn),
                 Err(e) => {
                     println!("{} Invalid catalog number: {}", "⚠".yellow(), e);
@@ -805,7 +809,7 @@ fn play_preview(project: &Project) {
                 "{}. {} ({})",
                 t.number,
                 t.title,
-                crate::core::track::format_duration_ms(t.duration)
+                format_duration_ms(t.duration)
             )
         })
         .collect();
@@ -847,7 +851,7 @@ fn play_preview(project: &Project) {
 }
 
 /// Play a single track with progress display
-fn play_single_track(track: &crate::core::Track) {
+fn play_single_track(track: &Track) {
     use indicatif::{ProgressBar, ProgressStyle};
     use std::io::{self, Read};
 
@@ -866,7 +870,7 @@ fn play_single_track(track: &crate::core::Track) {
     }
 
     // Initialize player
-    let mut player = match crate::audio::Player::new() {
+    let mut player = match Player::new() {
         Ok(p) => p,
         Err(e) => {
             println!("{} Failed to initialize audio: {}", "✗".red(), e);
@@ -884,7 +888,7 @@ fn play_single_track(track: &crate::core::Track) {
     };
 
     let duration_secs = duration.as_secs();
-    let duration_str = crate::core::track::format_duration_ms(duration);
+    let duration_str = format_duration_ms(duration);
 
     // Create progress bar
     let pb = ProgressBar::new(duration_secs);
@@ -942,7 +946,7 @@ fn play_single_track(track: &crate::core::Track) {
                 pb.set_position(elapsed_secs);
 
                 let status = if player.is_paused() { "⏸ PAUSED" } else { "▶ Playing" };
-                let elapsed_str = crate::core::track::format_duration_ms(elapsed);
+                let elapsed_str = format_duration_ms(elapsed);
                 pb.set_message(format!("{} {}/{}", status, elapsed_str, duration_str));
 
                 // Check for keyboard input
@@ -987,7 +991,7 @@ fn play_single_track(track: &crate::core::Track) {
 }
 
 /// Simple blocking playback without keyboard controls
-fn simple_playback(player: &crate::audio::Player, duration: std::time::Duration) {
+fn simple_playback(player: &Player, duration: std::time::Duration) {
     use indicatif::{ProgressBar, ProgressStyle};
 
     let duration_secs = duration.as_secs();
@@ -1024,7 +1028,7 @@ fn play_all_tracks(project: &Project) {
     println!();
 
     // Initialize player once
-    let mut player = match crate::audio::Player::new() {
+    let mut player = match Player::new() {
         Ok(p) => p,
         Err(e) => {
             println!("{} Failed to initialize audio: {}", "✗".red(), e);
@@ -1037,7 +1041,7 @@ fn play_all_tracks(project: &Project) {
             "\n{} {} - {}",
             format!("Track {}:", track.number).cyan(),
             track.title.bold(),
-            crate::core::track::format_duration_ms(track.duration)
+            format_duration_ms(track.duration)
         );
 
         if !track.source_file.exists() {
@@ -1116,7 +1120,7 @@ fn play_transition(project: &Project) {
     );
 
     // Initialize player
-    let mut player = match crate::audio::Player::new() {
+    let mut player = match Player::new() {
         Ok(p) => p,
         Err(e) => {
             println!("{} Failed to initialize audio: {}", "✗".red(), e);
@@ -1201,7 +1205,7 @@ fn export_master(project: &mut Project) {
             return;
         }
 
-        match crate::audio::wav::read_wav_info(&track.source_file) {
+        match wav::read_wav_info(&track.source_file) {
             Ok(info) => {
                 if !info.is_red_book_compliant() {
                     println!(
@@ -1294,7 +1298,7 @@ fn export_master(project: &mut Project) {
         pb.set_message("Concatenating audio tracks...");
         pb.enable_steady_tick(std::time::Duration::from_millis(100));
 
-        match crate::audio::concat::concatenate_tracks(&project.album.tracks, &wav_path) {
+        match concat::concatenate_tracks(&project.album.tracks, &wav_path) {
             Ok(()) => {
                 pb.finish_and_clear();
                 println!("{} Created: {}", "✓".green(), wav_path.display());
@@ -1312,7 +1316,7 @@ fn export_master(project: &mut Project) {
             .and_then(|s| s.to_str())
             .unwrap_or("master.wav");
 
-        match crate::export::cue::generate_cue(&project.album, wav_filename, &cue_path) {
+        match cue::generate_cue(&project.album, wav_filename, &cue_path) {
             Ok(()) => {
                 println!("{} Created: {}", "✓".green(), cue_path.display());
             }
@@ -1323,7 +1327,7 @@ fn export_master(project: &mut Project) {
         }
 
         // 3. Generate TOC file
-        match crate::export::toc::generate_toc(&project.album, wav_filename, &toc_path) {
+        match toc::generate_toc(&project.album, wav_filename, &toc_path) {
             Ok(()) => {
                 println!("{} Created: {}", "✓".green(), toc_path.display());
             }
@@ -1334,7 +1338,7 @@ fn export_master(project: &mut Project) {
         }
     } else {
         // Multi-file mode - just generate CUE referencing original files
-        match crate::export::cue::generate_cue_multi(&project.album, &cue_path) {
+        match cue::generate_cue_multi(&project.album, &cue_path) {
             Ok(()) => {
                 println!("{} Created: {}", "✓".green(), cue_path.display());
             }
@@ -1384,7 +1388,7 @@ fn export_master(project: &mut Project) {
 
 /// Burn CD using cdrdao
 fn burn_cd(project: &mut Project) {
-    use crate::burn::cdrdao::{self, BurnOptions, Cdrdao, CdDrive};
+    use cdrdao::{BurnOptions, CdTextDriver, Cdrdao, CdDrive};
 
     println!();
     println!("{}", "Burn CD".bold().green());
@@ -1625,12 +1629,13 @@ fn burn_cd(project: &mut Project) {
     };
 
     // Create burn options
+    // Using GenericMmcRaw for CD-TEXT support (previous default behavior)
     let options = BurnOptions {
         device: drive.device.clone(),
         speed,
         simulate: false,
         eject: true,
-        force_raw_driver: true,
+        cd_text_driver: CdTextDriver::GenericMmcRaw,
     };
 
     let burner = Cdrdao::new(options);
@@ -1743,7 +1748,7 @@ fn validate_project(project: &Project) {
                 .album
                 .tracks
                 .iter()
-                .filter(|t| t.duration >= crate::core::track::MIN_TRACK_DURATION)
+                .filter(|t| t.duration >= MIN_TRACK_DURATION)
                 .count();
 
             println!("  Track duration: {}/{} tracks >= 4 seconds", compliant_tracks, project.album.track_count());

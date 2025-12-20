@@ -1,19 +1,69 @@
 # Red Book Master
 
-A CLI tool for creating Red Book compatible CD masters with CUE sheet output.
+A professional tool for creating Red Book compatible CD masters with CUE sheet output. Available as both a **GUI application** and a **CLI tool**.
+
+![Red Book Master GUI](screenshots/redbookmaster_main_view.png)
 
 ## Features
 
-- **Interactive wizard** - Guided step-by-step experience for creating CD masters
-- **Native file browser** - Select WAV files using your system's file dialog
+- **Modern GUI application** - Native desktop app with dark theme, waveform display, and intuitive controls
+- **Interactive CLI wizard** - Guided step-by-step experience for creating CD masters
 - **Red Book compliant** - Enforces CD-DA specifications (16-bit, 44.1kHz stereo)
 - **Automatic format conversion** - Converts non-compliant WAV files (resampling, bit depth, channels)
-- **Audio preview** - Play tracks, albums, and track transitions before burning
+- **Waveform visualization** - Zoomable/scrollable waveform display with playhead
+- **Audio preview** - Play tracks with real-time position tracking
 - **Full metadata support** - CD-TEXT, ISRC codes, MCN/UPC catalog numbers
 - **CUE sheet export** - Industry-standard format for CD mastering
 - **TOC file export** - Compatible with cdrdao for disc-at-once burning
-- **CD burning** - Direct burning via cdrdao with CD-TEXT support
+- **CD burning** - Direct burning via cdrdao with progress display and CD-TEXT support
 - **Project files** - Save and load projects in .rbm format
+- **Drag & drop track reordering** - Easily arrange tracks in the GUI
+
+## GUI Application
+
+The GUI provides a professional desktop experience for CD mastering:
+
+### Main Features
+
+- **Track List Panel** - View and manage tracks with number, title, duration, pregap, and postgap
+- **Waveform View** - Zoomable waveform display for the selected track with playhead
+- **Metadata Editor** - Edit track and album metadata in real-time
+- **Playback Controls** - Play, pause, stop, previous/next track, volume control
+- **Menu Bar** - Quick access to New, Open, Save, Export, and Burn CD
+
+### CD Burning Dialog
+
+The burn dialog provides a complete burning experience:
+
+![Burn Options](screenshots/redbookmaster_cd_burn_options_view.png)
+
+- **Drive Selection** - Choose from detected CD/DVD drives
+- **Speed Selection** - Auto, 1x, 2x, 4x, 8x, 16x, 24x, 48x
+- **Options** - Eject disc, Enable CD-TEXT, Simulate only
+- **Real-time Progress** - Progress bar with MB written percentage
+
+![Burn Progress](screenshots/redbookmaster_cd_burn_progress_view.png)
+
+- **Live Log Output** - See cdrdao output in real-time
+- **Cancel Support** - Abort burning if needed (disc may be unusable)
+
+![Burn Error](screenshots/redbookmaster_cd_burn_error_view.png)
+
+- **Error Details** - Full log preserved for debugging when errors occur
+
+### Keyboard Shortcuts
+
+| Shortcut | Action |
+|----------|--------|
+| ⌘+N | New project |
+| ⌘+O | Open project |
+| ⌘+S | Save project |
+| ⌘+Shift+S | Save As |
+| Space | Play/Pause |
+| Escape | Stop playback |
+| ↑/↓ | Select previous/next track |
+| ←/→ | Previous/Next track |
+| Delete | Remove selected track |
 
 ## Installation
 
@@ -31,15 +81,53 @@ cd redbookmaster
 cargo build --release
 ```
 
-The binary will be at `target/release/redbookmaster`.
+Binaries will be at:
+- `target/release/redbookmaster` - CLI application
+- `target/release/redbookmaster-gui` - GUI application
 
 ### Install via Cargo
 
 ```bash
-cargo install --path .
+# Install both CLI and GUI
+cargo install --path crates/redbookmaster-cli
+cargo install --path crates/redbookmaster-gui
 ```
 
-## Usage
+### Run the GUI
+
+```bash
+# From the repository
+cargo run -p redbookmaster-gui
+
+# Or after installation
+redbookmaster-gui
+```
+
+### Run the CLI
+
+```bash
+# From the repository
+cargo run -p redbookmaster
+
+# Or after installation
+redbookmaster
+```
+
+## Project Structure
+
+The repository is organized as a Cargo workspace:
+
+```
+redbookmaster/
+├── crates/
+│   ├── redbookmaster-lib/    # Shared library (core, audio, export, burn)
+│   ├── redbookmaster-cli/    # CLI application
+│   └── redbookmaster-gui/    # GUI application (Slint)
+├── screenshots/              # Application screenshots
+└── README.md
+```
+
+## CLI Usage
 
 ### Interactive Mode (Recommended)
 
@@ -106,6 +194,19 @@ redbookmaster info
 
 ## Workflow Example
 
+### GUI Workflow
+
+1. Click **New** to create a project (choose location and name)
+2. Click **Add Tracks** to add WAV files
+3. Non-compliant files are automatically detected and can be transcoded
+4. Edit track/album metadata in the right panel
+5. Drag tracks to reorder them
+6. Use playback controls to preview
+7. Click **Export** to generate master WAV, CUE, and TOC files
+8. Click **Burn CD** to open the burn dialog and write to disc
+
+### CLI Workflow
+
 ```
 $ redbookmaster
 
@@ -129,28 +230,6 @@ Welcome to Red Book Master!
 
 ? Save project as: my-awesome-album.rbm
 ✓ Project saved
-
-# Later...
-? Choose an action:
-> Export master
-
-? Export format:
-> Single WAV + CUE (recommended for burning)
-
-? Output directory: ./master
-✓ Created: ./master/my-awesome-album.wav
-✓ Created: ./master/my-awesome-album.cue
-✓ Created: ./master/my-awesome-album.toc
-✓ Project saved with export location
-
-? Choose an action:
-> Burn CD
-
-✓ Found exported master:
-  TOC: ./master/my-awesome-album.toc
-  WAV: ./master/my-awesome-album.wav
-✓ Found: cdrdao version 1.2.5
-...
 ```
 
 ## Audio Format Conversion
@@ -163,11 +242,6 @@ Red Book Master automatically handles non-compliant WAV files:
 | 24-bit, 32-bit | Converted to 16-bit with TPDF dithering |
 | Mono | Duplicated to stereo |
 | 32-bit float | Converted to 16-bit integer |
-
-When adding a non-compliant file, you'll be prompted to:
-- **Convert automatically** - Creates a Red Book compliant copy
-- **Skip this file** - Continue without adding
-- **Abort** - Stop adding tracks
 
 ## Red Book Specifications
 
@@ -183,14 +257,24 @@ The tool enforces the following CD-DA (Red Book) specifications:
 | ISRC format | CC-XXX-YY-NNNNN (country-registrant-year-designation) |
 | MCN format | 13 digits (UPC/EAN with check digit) |
 
-## Project Structure
+## Project Files
 
-Projects are saved as `.rbm` files (JSON format) containing:
+Projects are saved as `.rbm` files (JSON format) in a project directory:
 
+```
+MyAlbum_rbm/
+├── MyAlbum.rbm           # Project file (JSON)
+├── _transcoded/          # Converted files (if any)
+│   └── 01_track.wav
+├── myalbum.wav           # Master WAV (after export)
+├── myalbum.cue           # CUE sheet
+└── myalbum.toc           # TOC file for cdrdao
+```
+
+Project files contain:
 - Album metadata (title, performer, songwriter, catalog number)
 - Track list with individual metadata (title, performer, ISRC)
 - Gap configurations (pregap, postgap per track)
-- Export directory location (remembered for burning)
 - CD-TEXT information
 
 ## Output Formats
@@ -237,37 +321,28 @@ Red Book Master automatically searches for cdrdao in:
 
 | Crate | Purpose |
 |-------|---------|
-| clap | Command-line argument parsing |
-| inquire | Interactive prompts and menus |
+| slint | GUI framework (GUI only) |
+| clap | Command-line argument parsing (CLI only) |
+| inquire | Interactive prompts and menus (CLI only) |
 | hound | WAV file reading and writing |
 | rodio | Audio playback |
 | rubato | High-quality audio resampling |
 | rfd | Native file dialogs |
 | serde / serde_json | Project file serialization |
-| colored | Terminal colors |
+| dirs | User preferences directory |
+| colored | Terminal colors (CLI only) |
 | thiserror | Error handling |
 | chrono | Timestamps |
-| indicatif | Progress bars |
-| regex | Filename pattern matching |
-
-## Playback Controls
-
-During audio preview:
-
-| Key | Action |
-|-----|--------|
-| Space | Pause/Resume |
-| `q` | Stop playback |
-| `n` | Next track (album mode) |
-| `+` / `-` | Volume up/down |
+| indicatif | Progress bars (CLI only) |
 
 ## Tips
 
 1. **Use lower burn speeds** - 4x or 8x is recommended for audio CDs
-2. **Simulate first** - Always simulate burns before actual writing
+2. **Simulate first** - Use the "Simulate only" option before actual burning
 3. **Check track gaps** - Default is 2s for track 1, 0 for others
-4. **Preview transitions** - Use transition preview to check gaps between tracks
-5. **Save often** - Projects auto-save after export, but save manually after edits
+4. **Preview playback** - Listen to tracks before exporting
+5. **Export before burning** - The burn dialog requires an exported TOC file
+6. **CD-TEXT compatibility** - Some drives don't support CD-TEXT; disable if burning fails
 
 ## Troubleshooting
 
@@ -283,6 +358,14 @@ Ensure you have a working audio output device. The program uses the system defau
 
 Large files (especially high sample rates) take longer to convert. The FFT-based resampler prioritizes quality over speed.
 
+### CD-TEXT burning fails
+
+Some drives don't support CD-TEXT with the `--driver generic-mmc-raw` option. Disable the "Enable CD-TEXT" option in the burn dialog and try again.
+
+### GUI window size not saving
+
+Window size is saved to `~/Library/Application Support/redbookmaster/preferences.json` on macOS. Delete this file to reset preferences.
+
 ## License
 
 MIT
@@ -293,6 +376,7 @@ Contributions are welcome! Please feel free to submit issues and pull requests.
 
 ## Acknowledgments
 
+- [Slint](https://slint.dev/) - Modern GUI framework
 - [hound](https://github.com/ruuda/hound) - WAV file handling
 - [rodio](https://github.com/RustAudio/rodio) - Audio playback
 - [rubato](https://github.com/HEnquist/rubato) - High-quality resampling

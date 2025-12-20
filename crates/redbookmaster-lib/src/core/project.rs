@@ -20,12 +20,18 @@ pub struct Project {
     pub album: Album,
 
     /// Directory where master was exported (CUE, WAV, TOC files)
+    /// Deprecated: exports now go to project_dir/redbookmaster/
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub export_dir: Option<PathBuf>,
 
-    /// Path to the project file (not serialized)
+    /// Path to the project file (not serialized, set on load/save)
     #[serde(skip)]
     pub file_path: Option<PathBuf>,
+
+    /// Project directory (not serialized, derived from file_path.parent())
+    /// This is where all project files (tracks, exports) are stored
+    #[serde(skip)]
+    pub project_dir: Option<PathBuf>,
 }
 
 impl Project {
@@ -36,6 +42,7 @@ impl Project {
             album,
             export_dir: None,
             file_path: None,
+            project_dir: None,
         }
     }
 
@@ -53,6 +60,8 @@ impl Project {
             .map_err(|e| ProjectError::ParseError(path.to_path_buf(), e))?;
 
         project.file_path = Some(path.to_path_buf());
+        // Derive project_dir from file path's parent directory
+        project.project_dir = path.parent().map(|p| p.to_path_buf());
 
         // Handle version migrations if needed
         if project.version > PROJECT_VERSION {
@@ -96,6 +105,7 @@ impl Project {
     pub fn save_as(&mut self, path: &Path) -> Result<(), ProjectError> {
         self.save_to(path)?;
         self.file_path = Some(path.to_path_buf());
+        self.project_dir = path.parent().map(|p| p.to_path_buf());
         Ok(())
     }
 
@@ -157,6 +167,12 @@ impl Project {
         } else {
             false
         }
+    }
+
+    /// Generate a sanitized base name from the album title for export files
+    /// Delegates to Album::sanitized_base_name()
+    pub fn sanitized_base_name(&self) -> String {
+        self.album.sanitized_base_name()
     }
 }
 

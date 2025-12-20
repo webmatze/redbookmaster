@@ -184,6 +184,16 @@ impl Album {
         summary.push_str(&format!("Total: {}\n", self.format_duration()));
         summary
     }
+
+    /// Generate a sanitized base name from the album title for export files
+    /// Returns "master" if the album title is empty or contains only special characters
+    pub fn sanitized_base_name(&self) -> String {
+        let base = self.title
+            .replace(|c: char| !c.is_alphanumeric() && c != ' ', "")
+            .replace(' ', "_")
+            .to_lowercase();
+        if base.is_empty() { "master".to_string() } else { base }
+    }
 }
 
 impl Default for Album {
