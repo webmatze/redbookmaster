@@ -168,6 +168,12 @@ impl Project {
             false
         }
     }
+
+    /// Generate a sanitized base name from the album title for export files
+    /// Delegates to Album::sanitized_base_name()
+    pub fn sanitized_base_name(&self) -> String {
+        self.album.sanitized_base_name()
+    }
 }
 
 #[derive(Debug, thiserror::Error)]

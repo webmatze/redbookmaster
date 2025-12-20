@@ -141,6 +141,15 @@ impl AppState {
         self.preferences.save();
     }
 
+    /// Auto-save the project if a path and project exist
+    fn auto_save(&self) {
+        if let (Some(path), Some(project)) = (&self.project_path, &self.project) {
+            if let Err(e) = project.save_to(path) {
+                eprintln!("Auto-save failed: {}", e);
+            }
+        }
+    }
+
     fn tracks_to_model(&self) -> Vec<TrackData> {
         let Some(project) = &self.project else {
             return Vec::new();
@@ -508,13 +517,7 @@ fn main() -> Result<(), slint::PlatformError> {
 
             // Auto-save project after adding tracks
             if added > 0 {
-                if let Some(ref path) = state.project_path {
-                    if let Some(ref project) = state.project {
-                        if let Err(e) = project.save_to(path) {
-                            eprintln!("Auto-save failed: {}", e);
-                        }
-                    }
-                }
+                state.auto_save();
             }
 
             if let Some(app) = app_weak.upgrade() {
@@ -751,14 +754,7 @@ fn main() -> Result<(), slint::PlatformError> {
             if let Some(app) = app_weak.upgrade() {
                 app.set_album(state.album_to_model());
             }
-            // Auto-save project
-            if let Some(ref path) = state.project_path {
-                if let Some(ref project) = state.project {
-                    if let Err(e) = project.save_to(path) {
-                        eprintln!("Auto-save failed: {}", e);
-                    }
-                }
-            }
+            state.auto_save();
         }
     });
 
@@ -771,14 +767,7 @@ fn main() -> Result<(), slint::PlatformError> {
             if let Some(app) = app_weak.upgrade() {
                 app.set_album(state.album_to_model());
             }
-            // Auto-save project
-            if let Some(ref path) = state.project_path {
-                if let Some(ref project) = state.project {
-                    if let Err(e) = project.save_to(path) {
-                        eprintln!("Auto-save failed: {}", e);
-                    }
-                }
-            }
+            state.auto_save();
         }
     });
 
@@ -794,14 +783,7 @@ fn main() -> Result<(), slint::PlatformError> {
                     let model = Rc::new(slint::VecModel::from(tracks));
                     app.set_tracks(model.into());
                 }
-                // Auto-save project
-                if let Some(ref path) = state.project_path {
-                    if let Some(ref project) = state.project {
-                        if let Err(e) = project.save_to(path) {
-                            eprintln!("Auto-save failed: {}", e);
-                        }
-                    }
-                }
+                state.auto_save();
             }
         }
     });
@@ -1083,10 +1065,7 @@ fn main() -> Result<(), slint::PlatformError> {
         state_clone.borrow_mut().skip_cd_text_validation = false;
 
         // Generate filenames based on album title
-        let base_name = album.title.replace(|c: char| !c.is_alphanumeric() && c != ' ', "")
-            .replace(' ', "_")
-            .to_lowercase();
-        let base_name = if base_name.is_empty() { "master".to_string() } else { base_name };
+        let base_name = album.sanitized_base_name();
 
         let wav_path = project_dir.join(format!("{}.wav", base_name));
         let cue_path = project_dir.join(format!("{}.cue", base_name));
@@ -1229,15 +1208,9 @@ fn main() -> Result<(), slint::PlatformError> {
         }
 
         // Check if TOC file exists in project directory
-        // Use same naming logic as export
         let project_dir = project.project_dir.as_ref();
         let toc_exists = project_dir.map(|dir| {
-            let base_name = project.album.title
-                .replace(|c: char| !c.is_alphanumeric() && c != ' ', "")
-                .replace(' ', "_")
-                .to_lowercase();
-            let base_name = if base_name.is_empty() { "master".to_string() } else { base_name };
-            dir.join(format!("{}.toc", base_name)).exists()
+            dir.join(format!("{}.toc", project.sanitized_base_name())).exists()
         }).unwrap_or(false);
 
         if !toc_exists {
@@ -1418,13 +1391,8 @@ fn main() -> Result<(), slint::PlatformError> {
                 0
             };
 
-            // Get TOC file path (same naming logic as export)
-            let base_name = project.album.title
-                .replace(|c: char| !c.is_alphanumeric() && c != ' ', "")
-                .replace(' ', "_")
-                .to_lowercase();
-            let base_name = if base_name.is_empty() { "master".to_string() } else { base_name };
-            let toc_path = project_dir.join(format!("{}.toc", base_name));
+            // Get TOC file path
+            let toc_path = project_dir.join(format!("{}.toc", project.sanitized_base_name()));
 
             (device, speed, eject, cd_text, cd_text_driver_index, simulate, toc_path)
         };
@@ -1757,14 +1725,7 @@ fn main() -> Result<(), slint::PlatformError> {
                     state.waveform_cache.clear();
                     state.displayed_track_num = None;
 
-                    // Auto-save project
-                    if let Some(ref path) = state.project_path {
-                        if let Some(ref project) = state.project {
-                            if let Err(e) = project.save_to(path) {
-                                eprintln!("Auto-save failed: {}", e);
-                            }
-                        }
-                    }
+                    state.auto_save();
                     true
                 } else {
                     false
@@ -1833,14 +1794,7 @@ fn main() -> Result<(), slint::PlatformError> {
                         let model = Rc::new(slint::VecModel::from(tracks));
                         app.set_tracks(model.into());
                     }
-                    // Auto-save project
-                    if let Some(ref path) = state.project_path {
-                        if let Some(ref project) = state.project {
-                            if let Err(e) = project.save_to(path) {
-                                eprintln!("Auto-save failed: {}", e);
-                            }
-                        }
-                    }
+                    state.auto_save();
                 }
             }
         }
@@ -1895,14 +1849,7 @@ fn main() -> Result<(), slint::PlatformError> {
             state.waveform_cache.clear();
             state.displayed_track_num = None;
 
-            // Auto-save project
-            if let Some(ref path) = state.project_path {
-                if let Some(ref project) = state.project {
-                    if let Err(e) = project.save_to(path) {
-                        eprintln!("Auto-save failed: {}", e);
-                    }
-                }
-            }
+            state.auto_save();
 
             (tracks, track_num)
         };
@@ -2184,14 +2131,7 @@ fn main() -> Result<(), slint::PlatformError> {
                                 added += 1;
                             }
 
-                            // Auto-save project
-                            if let Some(ref path) = state.project_path {
-                                if let Some(ref project) = state.project {
-                                    if let Err(e) = project.save_to(path) {
-                                        eprintln!("Auto-save failed: {}", e);
-                                    }
-                                }
-                            }
+                            state.auto_save();
 
                             // Update UI
                             let tracks: Vec<TrackData> = state.tracks_to_model();
