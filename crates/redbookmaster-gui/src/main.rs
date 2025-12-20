@@ -16,7 +16,7 @@ use redbookmaster_lib::audio::concat::concatenate_tracks;
 use redbookmaster_lib::audio::convert::convert_to_red_book;
 use redbookmaster_lib::audio::wav::{read_wav_info, WavInfo};
 use redbookmaster_lib::{generate_cue, generate_toc};
-use redbookmaster_lib::{Cdrdao, BurnOptions, cdrdao_available, list_drives};
+use redbookmaster_lib::{cdrdao_available, list_drives};
 use slint::Model;
 use serde::{Deserialize, Serialize};
 
@@ -1115,6 +1115,7 @@ fn main() -> Result<(), slint::PlatformError> {
         }
     });
 
+    // on_burn_cd - Opens the burn dialog
     let state_clone = state.clone();
     let app_weak = app.as_weak();
     app.on_burn_cd(move || {
@@ -1147,17 +1148,37 @@ fn main() -> Result<(), slint::PlatformError> {
             return;
         }
 
+        // Check if TOC file exists in project directory
+        // Use same naming logic as export
+        let project_dir = project.project_dir.as_ref();
+        let toc_exists = project_dir.map(|dir| {
+            let base_name = project.album.title
+                .replace(|c: char| !c.is_alphanumeric() && c != ' ', "")
+                .replace(' ', "_")
+                .to_lowercase();
+            let base_name = if base_name.is_empty() { "master".to_string() } else { base_name };
+            dir.join(format!("{}.toc", base_name)).exists()
+        }).unwrap_or(false);
+
+        if !toc_exists {
+            if let Some(app) = app_weak.upgrade() {
+                app.set_error_title("Export Required".into());
+                app.set_error_message("Please export the project first to generate the TOC file needed for burning.".into());
+                app.set_show_error_dialog(true);
+            }
+            return;
+        }
+
         // On macOS, unmount any mounted optical discs first
         #[cfg(target_os = "macos")]
         {
             if let Some(app) = app_weak.upgrade() {
-                app.set_status_message("Unmounting disc...".into());
+                app.set_status_message("Detecting CD drives...".into());
             }
             // Find and unmount optical discs using diskutil
             if let Ok(output) = std::process::Command::new("diskutil").args(["list"]).output() {
                 let stdout = String::from_utf8_lossy(&output.stdout);
                 for line in stdout.lines() {
-                    // Look for external/optical drives (typically disk1, disk2, etc.)
                     if line.contains("/dev/disk") && !line.contains("disk0") {
                         if let Some(disk) = line.split_whitespace().next() {
                             let _ = std::process::Command::new("diskutil")
@@ -1175,17 +1196,12 @@ fn main() -> Result<(), slint::PlatformError> {
         // On macOS, if no drives found via scanbus, try IORegistry detection
         #[cfg(target_os = "macos")]
         if drives.is_empty() {
-            if let Some(app) = app_weak.upgrade() {
-                app.set_status_message("Detecting CD drive via IORegistry...".into());
-            }
-            // Try to detect via ioreg
             if let Ok(output) = std::process::Command::new("ioreg")
                 .args(["-c", "IOCDBlockStorageDevice", "-r", "-l"])
                 .output()
             {
                 let stdout = String::from_utf8_lossy(&output.stdout);
                 if stdout.contains("IOCDBlockStorageDevice") {
-                    // Found an optical drive - use IOKit device path
                     drives.push(redbookmaster_lib::CdDrive {
                         device: "IOCompactDiscServices".to_string(),
                         vendor: "Apple".to_string(),
@@ -1195,64 +1211,159 @@ fn main() -> Result<(), slint::PlatformError> {
             }
         }
 
-        if drives.is_empty() {
-            if let Some(app) = app_weak.upgrade() {
-                app.set_error_title("No CD Drive Found".into());
-                app.set_error_message("No CD drives detected.\n\nPlease ensure a CD drive is connected and close any system disc dialogs.".into());
-                app.set_show_error_dialog(true);
+        // Convert drives to Slint format
+        let slint_drives: Vec<CdDriveInfo> = drives.iter().map(|d| {
+            CdDriveInfo {
+                device: d.device.clone().into(),
+                vendor: d.vendor.clone().into(),
+                model: d.model.clone().into(),
+                display_name: format!("{} {}", d.vendor.trim(), d.model.trim()).into(),
             }
-            return;
+        }).collect();
+
+        let drive_names: Vec<slint::SharedString> = slint_drives.iter()
+            .map(|d| d.display_name.clone())
+            .collect();
+
+        // Speed options
+        let speed_options = vec![
+            BurnSpeedOption { value: 0, label: "Auto (recommended)".into() },
+            BurnSpeedOption { value: 1, label: "1x".into() },
+            BurnSpeedOption { value: 2, label: "2x".into() },
+            BurnSpeedOption { value: 4, label: "4x".into() },
+            BurnSpeedOption { value: 8, label: "8x".into() },
+            BurnSpeedOption { value: 16, label: "16x".into() },
+            BurnSpeedOption { value: 24, label: "24x".into() },
+            BurnSpeedOption { value: 48, label: "48x".into() },
+        ];
+
+        let speed_labels: Vec<slint::SharedString> = speed_options.iter()
+            .map(|s| s.label.clone())
+            .collect();
+
+        if let Some(app) = app_weak.upgrade() {
+            // Reset dialog state
+            app.set_is_burning(false);
+            app.set_burn_complete(false);
+            app.set_burn_error(false);
+            app.set_burn_progress(0.0);
+            app.set_burn_status("".into());
+            app.set_burn_log("".into());
+            app.set_burn_result_message("".into());
+
+            // Set dialog options
+            app.set_burn_selected_drive_index(0);
+            app.set_burn_selected_speed_index(0);
+            app.set_burn_eject(true);
+            app.set_burn_cd_text(false);
+            app.set_burn_simulate(false);
+
+            // Set drives and speed options
+            let drives_model: Rc<slint::VecModel<CdDriveInfo>> = Rc::new(slint::VecModel::from(slint_drives));
+            app.set_burn_available_drives(drives_model.into());
+
+            let drive_names_model: Rc<slint::VecModel<slint::SharedString>> = Rc::new(slint::VecModel::from(drive_names));
+            app.set_burn_drive_names(drive_names_model.into());
+
+            let speeds_model: Rc<slint::VecModel<BurnSpeedOption>> = Rc::new(slint::VecModel::from(speed_options));
+            app.set_burn_speed_options(speeds_model.into());
+
+            let speed_labels_model: Rc<slint::VecModel<slint::SharedString>> = Rc::new(slint::VecModel::from(speed_labels));
+            app.set_burn_speed_labels(speed_labels_model.into());
+
+            // Show dialog
+            app.set_show_burn_dialog(true);
+            app.set_status_message("Configure burn settings...".into());
         }
+    });
 
-        // Ask user to select TOC file
-        let dialog = rfd::FileDialog::new()
-            .set_title("Select TOC File to Burn")
-            .add_filter("TOC files", &["toc"]);
+    // Shared state for burn thread communication
+    let burn_log: Arc<std::sync::Mutex<Vec<String>>> = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let burn_complete: Arc<AtomicBool> = Arc::new(AtomicBool::new(false));
+    let burn_error: Arc<AtomicBool> = Arc::new(AtomicBool::new(false));
+    let burn_error_message: Arc<std::sync::Mutex<String>> = Arc::new(std::sync::Mutex::new(String::new()));
+    let burn_child_process: Arc<std::sync::Mutex<Option<std::process::Child>>> = Arc::new(std::sync::Mutex::new(None));
 
-        let Some(toc_path) = dialog.pick_file() else {
-            return;
+    // on_start_burn - Starts the burn process in background
+    let state_clone = state.clone();
+    let app_weak = app.as_weak();
+    let burn_log_clone = burn_log.clone();
+    let burn_complete_clone = burn_complete.clone();
+    let burn_error_clone = burn_error.clone();
+    let burn_error_msg_clone = burn_error_message.clone();
+    let burn_child_clone = burn_child_process.clone();
+    app.on_start_burn(move || {
+        // Get burn settings from UI
+        let (device, speed, eject, cd_text, simulate, toc_path) = {
+            let state = state_clone.borrow();
+            let Some(ref project) = state.project else { return; };
+            let Some(ref project_dir) = project.project_dir else { return; };
+
+            let app = match app_weak.upgrade() {
+                Some(a) => a,
+                None => return,
+            };
+
+            let drive_idx = app.get_burn_selected_drive_index() as usize;
+            let speed_idx = app.get_burn_selected_speed_index() as usize;
+            let eject = app.get_burn_eject();
+            let cd_text = app.get_burn_cd_text();
+            let simulate = app.get_burn_simulate();
+
+            // Get drive device from available drives
+            let drives = app.get_burn_available_drives();
+            let device = if drive_idx < drives.row_count() {
+                drives.row_data(drive_idx).map(|d| d.device.to_string()).unwrap_or_default()
+            } else {
+                return;
+            };
+
+            // Get speed value from speed options
+            let speeds = app.get_burn_speed_options();
+            let speed = if speed_idx < speeds.row_count() {
+                speeds.row_data(speed_idx).map(|s| s.value as u32).unwrap_or(0)
+            } else {
+                0
+            };
+
+            // Get TOC file path (same naming logic as export)
+            let base_name = project.album.title
+                .replace(|c: char| !c.is_alphanumeric() && c != ' ', "")
+                .replace(' ', "_")
+                .to_lowercase();
+            let base_name = if base_name.is_empty() { "master".to_string() } else { base_name };
+            let toc_path = project_dir.join(format!("{}.toc", base_name));
+
+            (device, speed, eject, cd_text, simulate, toc_path)
         };
 
         if !toc_path.exists() {
             if let Some(app) = app_weak.upgrade() {
-                app.set_error_title("File Not Found".into());
-                app.set_error_message("TOC file not found. Please export the project first.".into());
-                app.set_show_error_dialog(true);
+                app.set_burn_error(true);
+                app.set_burn_result_message("TOC file not found. Please export the project first.".into());
             }
             return;
         }
 
-        // Use first available drive
-        let drive = &drives[0];
-
-        // Ask about CD-TEXT mode
-        let cdtext_confirm = rfd::MessageDialog::new()
-            .set_title("CD-TEXT Mode")
-            .set_description("Enable CD-TEXT?\n\nCD-TEXT embeds track/album titles on the disc, but uses a driver mode that can fail on some drives.\n\nIf burning fails, try again with CD-TEXT disabled.")
-            .set_buttons(rfd::MessageButtons::YesNo)
-            .show();
-
-        let use_cdtext = cdtext_confirm == rfd::MessageDialogResult::Yes;
-
-        // Confirm burn
-        let confirm = rfd::MessageDialog::new()
-            .set_title("Burn CD")
-            .set_description(&format!(
-                "Burn to {} {}?\n\nDevice: {}\nCD-TEXT: {}\n\nMake sure:\n• A blank CD-R is inserted\n• Any system disc dialogs are closed\n\nClick OK to start burning.",
-                drive.vendor, drive.model, drive.device,
-                if use_cdtext { "Enabled" } else { "Disabled" }
-            ))
-            .set_buttons(rfd::MessageButtons::OkCancel)
-            .show();
-
-        if confirm != rfd::MessageDialogResult::Ok {
-            if let Some(app) = app_weak.upgrade() {
-                app.set_status_message("Burn cancelled".into());
-            }
-            return;
+        // Reset burn state
+        if let Ok(mut log) = burn_log_clone.lock() {
+            log.clear();
+        }
+        burn_complete_clone.store(false, Ordering::SeqCst);
+        burn_error_clone.store(false, Ordering::SeqCst);
+        if let Ok(mut msg) = burn_error_msg_clone.lock() {
+            msg.clear();
         }
 
-        // Unmount again right before burning (in case macOS re-mounted)
+        // Set UI to burning state
+        if let Some(app) = app_weak.upgrade() {
+            app.set_is_burning(true);
+            app.set_burn_progress(0.0);
+            app.set_burn_status("Starting burn...".into());
+            app.set_burn_log("".into());
+        }
+
+        // On macOS, unmount discs before burning
         #[cfg(target_os = "macos")]
         {
             if let Ok(output) = std::process::Command::new("diskutil").args(["list"]).output() {
@@ -1269,79 +1380,163 @@ fn main() -> Result<(), slint::PlatformError> {
             }
         }
 
-        if let Some(app) = app_weak.upgrade() {
-            app.set_status_message("Burning CD... (this may take several minutes)".into());
-        }
+        // Clone shared state for thread
+        let burn_log_thread = burn_log_clone.clone();
+        let burn_complete_thread = burn_complete_clone.clone();
+        let burn_error_thread = burn_error_clone.clone();
+        let burn_error_msg_thread = burn_error_msg_clone.clone();
+        let burn_child_thread = burn_child_clone.clone();
 
-        // Create burn options
-        let burn_options = BurnOptions {
-            device: drive.device.clone(),
-            speed: 0, // Auto
-            simulate: false,
-            eject: true,
-            force_raw_driver: use_cdtext, // Only use raw driver for CD-TEXT
-        };
+        // Spawn burn thread
+        std::thread::spawn(move || {
+            println!("=== Starting CD burn ===");
+            println!("TOC file: {}", toc_path.display());
+            println!("Device: {}", device);
+            println!("Speed: {} (0=auto)", speed);
+            println!("CD-TEXT: {}", if cd_text { "Enabled" } else { "Disabled" });
+            println!("Simulate: {}", simulate);
+            println!("========================");
 
-        let burner = Cdrdao::new(burn_options.clone());
-
-        println!("=== Starting CD burn ===");
-        println!("TOC file: {}", toc_path.display());
-        println!("Device: {}", burn_options.device);
-        println!("Speed: {} (0=auto)", burn_options.speed);
-        println!("CD-TEXT: {}", if burn_options.force_raw_driver { "Enabled (raw driver)" } else { "Disabled" });
-        println!("========================");
-        println!("TIP: If burn fails, try running with sudo:");
-        println!("  sudo cargo run -p redbookmaster-gui");
-        println!("========================");
-
-        // Burn!
-        match burner.burn(&toc_path) {
-            Ok(()) => {
-                println!("=== Burn completed successfully ===");
-                if let Some(app) = app_weak.upgrade() {
-                    app.set_status_message("CD burned successfully!".into());
-                }
+            // Build cdrdao command
+            let mut cmd = std::process::Command::new("cdrdao");
+            cmd.arg("write");
+            cmd.arg("--device").arg(&device);
+            if cd_text {
+                cmd.arg("--driver").arg("generic-mmc-raw");
             }
-            Err(e) => {
-                let error_str = e.to_string();
-                println!("=== Burn failed ===");
-                println!("{}", error_str);
-                println!();
-                println!("SUGGESTIONS:");
-                if error_str.contains("Write data failed") {
-                    println!("  1. Try burning with CD-TEXT disabled");
-                    println!("  2. Try running with sudo: sudo cargo run -p redbookmaster-gui");
-                    println!("  3. Try a different CD-R disc");
-                    println!("  4. Try a slower burn speed");
-                }
-                if error_str.contains("Device already in use") || error_str.contains("Cannot grab") {
-                    println!("  - Close any Finder windows showing the disc");
-                    println!("  - Run: diskutil unmountDisk /dev/disk2 (or similar)");
-                }
-                println!("===================");
+            if speed > 0 {
+                cmd.arg("--speed").arg(speed.to_string());
+            }
+            if simulate {
+                cmd.arg("--simulate");
+            }
+            if eject {
+                cmd.arg("--eject");
+            }
+            cmd.arg("-v").arg("2");
+            cmd.arg(&toc_path);
 
-                if let Some(app) = app_weak.upgrade() {
-                    if error_str.contains("Device already in use") || error_str.contains("Cannot grab") {
-                        app.set_error_title("Drive Busy".into());
-                        app.set_error_message("The CD drive is in use by another application.\n\nClose any Finder windows showing the disc and try again.".into());
-                        app.set_show_error_dialog(true);
-                    } else if error_str.contains("Write data failed") {
-                        app.set_error_title("Burn Failed".into());
-                        app.set_error_message("Write failed during burning.\n\nTry:\n• Burning with CD-TEXT disabled\n• Using a different CD-R disc\n• Running with sudo".into());
-                        app.set_show_error_dialog(true);
-                    } else {
-                        app.set_error_title("Burn Failed".into());
-                        // Truncate long error messages
-                        let msg = if error_str.len() > 200 {
-                            format!("{}...\n\nSee console for details.", &error_str[..200])
-                        } else {
-                            error_str
-                        };
-                        app.set_error_message(msg.into());
-                        app.set_show_error_dialog(true);
+            // Set up for streaming output
+            cmd.stdout(std::process::Stdio::piped());
+            cmd.stderr(std::process::Stdio::piped());
+
+            // Spawn child process
+            match cmd.spawn() {
+                Ok(mut child) => {
+                    // Store child process handle for cancel support
+                    if let Ok(mut guard) = burn_child_thread.lock() {
+                        *guard = Some(std::mem::replace(&mut child, std::process::Command::new("true").spawn().unwrap()));
+                        std::mem::swap(&mut child, guard.as_mut().unwrap());
+                    }
+
+                    // Read stderr for progress (cdrdao outputs to stderr)
+                    let stderr = child.stderr.take();
+
+                    if let Some(stderr) = stderr {
+                        use std::io::BufRead;
+                        let reader = std::io::BufReader::new(stderr);
+
+                        for line in reader.lines() {
+                            if let Ok(line) = line {
+                                println!("[cdrdao] {}", line);
+
+                                // Add to log
+                                if let Ok(mut log) = burn_log_thread.lock() {
+                                    log.push(line.clone());
+                                }
+                            }
+                        }
+                    }
+
+                    // Wait for process to complete
+                    match child.wait() {
+                        Ok(status) => {
+                            if status.success() {
+                                println!("=== Burn completed successfully ===");
+                                burn_complete_thread.store(true, Ordering::SeqCst);
+                            } else {
+                                println!("=== Burn failed with status: {} ===", status);
+                                burn_error_thread.store(true, Ordering::SeqCst);
+                                if let Ok(mut msg) = burn_error_msg_thread.lock() {
+                                    *msg = format!("Burn process exited with status: {}", status);
+                                }
+                            }
+                        }
+                        Err(e) => {
+                            println!("=== Failed to wait for burn process: {} ===", e);
+                            burn_error_thread.store(true, Ordering::SeqCst);
+                            if let Ok(mut msg) = burn_error_msg_thread.lock() {
+                                *msg = format!("Failed to wait for burn process: {}", e);
+                            }
+                        }
+                    }
+                }
+                Err(e) => {
+                    println!("=== Failed to start cdrdao: {} ===", e);
+                    burn_error_thread.store(true, Ordering::SeqCst);
+                    if let Ok(mut msg) = burn_error_msg_thread.lock() {
+                        *msg = format!("Failed to start cdrdao: {}", e);
                     }
                 }
             }
+
+            // Clear child process handle
+            if let Ok(mut guard) = burn_child_thread.lock() {
+                *guard = None;
+            }
+        });
+    });
+
+    // on_cancel_burn - Cancels the burn process
+    let app_weak = app.as_weak();
+    let burn_child_cancel = burn_child_process.clone();
+    let burn_error_cancel = burn_error.clone();
+    let burn_error_msg_cancel = burn_error_message.clone();
+    app.on_cancel_burn(move || {
+        // Kill the child process if running
+        if let Ok(mut guard) = burn_child_cancel.lock() {
+            if let Some(ref mut child) = *guard {
+                println!("=== Cancelling burn process ===");
+                let _ = child.kill();
+            }
+        }
+
+        // Set error state (cancelled)
+        burn_error_cancel.store(true, Ordering::SeqCst);
+        if let Ok(mut msg) = burn_error_msg_cancel.lock() {
+            *msg = "Burn cancelled by user.\n\nNote: The disc may be unusable.".to_string();
+        }
+
+        if let Some(app) = app_weak.upgrade() {
+            app.set_is_burning(false);
+            app.set_burn_error(true);
+            app.set_burn_result_message("Burn cancelled by user.\n\nNote: The disc may be unusable.".into());
+        }
+    });
+
+    // on_close_burn_dialog - Closes the burn dialog and resets state
+    let app_weak = app.as_weak();
+    let burn_log_close = burn_log.clone();
+    let burn_complete_close = burn_complete.clone();
+    let burn_error_close = burn_error.clone();
+    app.on_close_burn_dialog(move || {
+        // Reset burn state
+        if let Ok(mut log) = burn_log_close.lock() {
+            log.clear();
+        }
+        burn_complete_close.store(false, Ordering::SeqCst);
+        burn_error_close.store(false, Ordering::SeqCst);
+
+        if let Some(app) = app_weak.upgrade() {
+            app.set_show_burn_dialog(false);
+            app.set_is_burning(false);
+            app.set_burn_complete(false);
+            app.set_burn_error(false);
+            app.set_burn_progress(0.0);
+            app.set_burn_status("".into());
+            app.set_burn_log("".into());
+            app.set_burn_result_message("".into());
+            app.set_status_message("Ready".into());
         }
     });
 
@@ -1712,6 +1907,11 @@ fn main() -> Result<(), slint::PlatformError> {
     let completed_for_timer = completed_conversions.clone();
     let done_for_timer = conversion_done.clone();
     let waveform_result_for_timer = waveform_result.clone();
+    // Burn state for timer polling
+    let burn_log_timer = burn_log.clone();
+    let burn_complete_timer = burn_complete.clone();
+    let burn_error_timer = burn_error.clone();
+    let burn_error_msg_timer = burn_error_message.clone();
     // Counter for periodic window size check (every ~2 seconds = 40 ticks at 50ms)
     let window_check_counter = Rc::new(std::cell::Cell::new(0u32));
     let timer = slint::Timer::default();
@@ -1800,6 +2000,98 @@ fn main() -> Result<(), slint::PlatformError> {
                             app.set_is_transcoding(false);
                             app.set_status_message(format!("Converted and added {} track(s)", added).into());
                         }
+                    }
+                }
+            }
+
+            // Check for burn progress updates
+            if let Some(app) = app_weak.upgrade() {
+                if app.get_is_burning() {
+                    // Update log from burn thread
+                    if let Ok(log) = burn_log_timer.try_lock() {
+                        if !log.is_empty() {
+                            let log_text = log.join("\n");
+                            app.set_burn_log(log_text.into());
+
+                            // Parse progress from cdrdao output
+                            // Look for "Wrote X of Y MB" for overall progress
+                            // Look for "Writing track XX" for status
+                            let mut found_progress = false;
+
+                            for line in log.iter().rev() {
+                                // Check for MB progress: "Wrote 375 of 375 MB"
+                                if !found_progress && line.contains(" of ") && line.contains(" MB") {
+                                    // Try to parse "Wrote X of Y MB" or "X of Y MB"
+                                    if let Some(mb_part) = line.split(" MB").next() {
+                                        let parts: Vec<&str> = mb_part.split(" of ").collect();
+                                        if parts.len() == 2 {
+                                            // Get the last number before "of" (current MB)
+                                            let current_str = parts[0].split_whitespace().last().unwrap_or("0");
+                                            let total_str = parts[1].trim();
+                                            if let (Ok(current), Ok(total)) = (current_str.parse::<f32>(), total_str.parse::<f32>()) {
+                                                if total > 0.0 {
+                                                    let progress = (current / total).min(1.0);
+                                                    app.set_burn_progress(progress);
+                                                    found_progress = true;
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+
+                                // Check for track status: "Writing track 01 (mode..."
+                                if line.contains("Writing track") {
+                                    if let Some(track_part) = line.split("Writing track ").nth(1) {
+                                        // Extract track number (e.g., "01" from "01 (mode AUDIO...")
+                                        let track_num = track_part.split_whitespace().next().unwrap_or("?");
+                                        app.set_burn_status(format!("Writing track {}...", track_num).into());
+                                    }
+                                    if found_progress { break; }
+                                } else if line.contains("CD-TEXT lead-in") || line.contains("Writing lead-in") {
+                                    app.set_burn_status("Writing lead-in...".into());
+                                    if !found_progress { app.set_burn_progress(0.02); }
+                                    break;
+                                } else if line.contains("Flushing cache") {
+                                    app.set_burn_status("Flushing cache...".into());
+                                    if !found_progress { app.set_burn_progress(0.98); }
+                                    break;
+                                } else if line.contains("Starting write") {
+                                    app.set_burn_status("Starting write...".into());
+                                    if !found_progress { app.set_burn_progress(0.01); }
+                                    break;
+                                }
+                            }
+                        }
+                    }
+
+                    // Check for completion
+                    if burn_complete_timer.load(Ordering::SeqCst) {
+                        burn_complete_timer.store(false, Ordering::SeqCst);
+                        app.set_is_burning(false);
+                        app.set_burn_complete(true);
+                        app.set_burn_progress(1.0);
+                        app.set_burn_result_message("Successfully burned CD!".into());
+                        app.set_status_message("CD burned successfully!".into());
+                    }
+
+                    // Check for error
+                    if burn_error_timer.load(Ordering::SeqCst) {
+                        burn_error_timer.store(false, Ordering::SeqCst);
+                        app.set_is_burning(false);
+                        app.set_burn_error(true);
+
+                        let error_msg = if let Ok(msg) = burn_error_msg_timer.lock() {
+                            if msg.is_empty() {
+                                "Burn failed. Check console for details.".to_string()
+                            } else {
+                                msg.clone()
+                            }
+                        } else {
+                            "Burn failed. Check console for details.".to_string()
+                        };
+
+                        app.set_burn_result_message(error_msg.into());
+                        app.set_status_message("CD burn failed".into());
                     }
                 }
             }

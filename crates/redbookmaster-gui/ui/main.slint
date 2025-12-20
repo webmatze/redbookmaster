@@ -65,6 +65,20 @@ export struct TranscodeFileInfo {
     path: string,
 }
 
+// CD drive info for burn dialog
+export struct CdDriveInfo {
+    device: string,
+    vendor: string,
+    model: string,
+    display-name: string,
+}
+
+// Speed option for burn dialog
+export struct BurnSpeedOption {
+    value: int,
+    label: string,
+}
+
 // Waveform display component
 component WaveformView inherits Rectangle {
     in property <[WaveformPeak]> peaks: [];
@@ -248,6 +262,32 @@ export component MainWindow inherits Window {
     in property <string> error-title: "Error";
     in property <string> error-message: "";
     callback dismiss-error();
+
+    // Burn dialog state
+    in property <bool> show-burn-dialog: false;
+    in property <[CdDriveInfo]> burn-available-drives: [];
+    in property <[string]> burn-drive-names: [];  // Display names for ComboBox
+    in-out property <int> burn-selected-drive-index: 0;
+    in property <[BurnSpeedOption]> burn-speed-options: [];
+    in property <[string]> burn-speed-labels: [];  // Labels for ComboBox
+    in-out property <int> burn-selected-speed-index: 0;
+    in-out property <bool> burn-eject: true;
+    in-out property <bool> burn-cd-text: false;
+    in-out property <bool> burn-simulate: false;
+
+    // Burn progress state
+    in property <bool> is-burning: false;
+    in property <float> burn-progress: 0.0;
+    in property <string> burn-status: "";
+    in property <string> burn-log: "";
+    in property <bool> burn-complete: false;
+    in property <bool> burn-error: false;
+    in property <string> burn-result-message: "";
+
+    // Burn dialog callbacks
+    callback start-burn();
+    callback cancel-burn();
+    callback close-burn-dialog();
 
     // Project state - controls which UI elements are enabled
     in property <bool> has-project: false;
@@ -1489,6 +1529,470 @@ export component MainWindow inherits Window {
 
                         ok-touch := TouchArea {
                             clicked => { root.dismiss-error(); }
+                        }
+
+                        Text {
+                            text: "OK";
+                            color: Theme.text-primary;
+                            font-size: 14px;
+                            font-weight: 600;
+                            horizontal-alignment: center;
+                            vertical-alignment: center;
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    // Burn CD dialog overlay
+    if root.show-burn-dialog: Rectangle {
+        x: 0;
+        y: 0;
+        width: 100%;
+        height: 100%;
+        background: #000000aa;
+
+        // Block clicks on background
+        TouchArea {}
+
+        // Dialog panel - dynamic height based on state
+        Rectangle {
+            property <length> config-height: 380px;
+            property <length> burning-height: 450px;
+            property <length> complete-height: 200px;
+            property <length> error-with-log-height: 400px;
+
+            width: 500px;
+            height: root.burn-error ? error-with-log-height :
+                   root.burn-complete ? complete-height :
+                   root.is-burning ? burning-height : config-height;
+            x: (parent.width - self.width) / 2;
+            y: (parent.height - self.height) / 2;
+            background: Theme.panel-background;
+            border-radius: 12px;
+            border-width: 1px;
+            border-color: Theme.panel-border;
+
+            // Configuration view (before burning starts)
+            if !root.is-burning && !root.burn-complete && !root.burn-error: VerticalLayout {
+                padding: 24px;
+                spacing: 16px;
+
+                // Title
+                Text {
+                    text: "Burn CD";
+                    color: Theme.text-primary;
+                    font-size: 18px;
+                    font-weight: 600;
+                    horizontal-alignment: center;
+                }
+
+                // Drive selection
+                VerticalLayout {
+                    spacing: 6px;
+
+                    Text {
+                        text: "Drive";
+                        color: Theme.text-secondary;
+                        font-size: 12px;
+                    }
+
+                    ComboBox {
+                        model: root.burn-drive-names;
+                        current-index <=> root.burn-selected-drive-index;
+                        enabled: root.burn-available-drives.length > 0;
+                    }
+                }
+
+                // Speed selection
+                VerticalLayout {
+                    spacing: 6px;
+
+                    Text {
+                        text: "Speed";
+                        color: Theme.text-secondary;
+                        font-size: 12px;
+                    }
+
+                    ComboBox {
+                        model: root.burn-speed-labels;
+                        current-index <=> root.burn-selected-speed-index;
+                    }
+                }
+
+                // Options section
+                VerticalLayout {
+                    spacing: 8px;
+
+                    Text {
+                        text: "Options";
+                        color: Theme.text-secondary;
+                        font-size: 12px;
+                    }
+
+                    // Eject checkbox
+                    HorizontalLayout {
+                        spacing: 8px;
+
+                        Rectangle {
+                            width: 18px;
+                            height: 18px;
+                            border-radius: 3px;
+                            border-width: 1px;
+                            border-color: Theme.panel-border;
+                            background: root.burn-eject ? Theme.accent : Theme.input-background;
+
+                            eject-touch := TouchArea {
+                                clicked => { root.burn-eject = !root.burn-eject; }
+                            }
+
+                            if root.burn-eject: Text {
+                                text: "✓";
+                                color: Theme.text-primary;
+                                font-size: 12px;
+                                horizontal-alignment: center;
+                                vertical-alignment: center;
+                            }
+                        }
+
+                        Text {
+                            text: "Eject disc when complete";
+                            color: Theme.text-primary;
+                            font-size: 13px;
+                            vertical-alignment: center;
+                        }
+                    }
+
+                    // CD-TEXT checkbox
+                    HorizontalLayout {
+                        spacing: 8px;
+
+                        Rectangle {
+                            width: 18px;
+                            height: 18px;
+                            border-radius: 3px;
+                            border-width: 1px;
+                            border-color: Theme.panel-border;
+                            background: root.burn-cd-text ? Theme.accent : Theme.input-background;
+
+                            cdtext-touch := TouchArea {
+                                clicked => { root.burn-cd-text = !root.burn-cd-text; }
+                            }
+
+                            if root.burn-cd-text: Text {
+                                text: "✓";
+                                color: Theme.text-primary;
+                                font-size: 12px;
+                                horizontal-alignment: center;
+                                vertical-alignment: center;
+                            }
+                        }
+
+                        Text {
+                            text: "Enable CD-TEXT (may fail on some drives)";
+                            color: Theme.text-primary;
+                            font-size: 13px;
+                            vertical-alignment: center;
+                        }
+                    }
+
+                    // Simulate checkbox
+                    HorizontalLayout {
+                        spacing: 8px;
+
+                        Rectangle {
+                            width: 18px;
+                            height: 18px;
+                            border-radius: 3px;
+                            border-width: 1px;
+                            border-color: Theme.panel-border;
+                            background: root.burn-simulate ? Theme.accent : Theme.input-background;
+
+                            simulate-touch := TouchArea {
+                                clicked => { root.burn-simulate = !root.burn-simulate; }
+                            }
+
+                            if root.burn-simulate: Text {
+                                text: "✓";
+                                color: Theme.text-primary;
+                                font-size: 12px;
+                                horizontal-alignment: center;
+                                vertical-alignment: center;
+                            }
+                        }
+
+                        Text {
+                            text: "Simulate only (test without writing)";
+                            color: Theme.text-primary;
+                            font-size: 13px;
+                            vertical-alignment: center;
+                        }
+                    }
+                }
+
+                // Warning note
+                HorizontalLayout {
+                    spacing: 8px;
+                    alignment: center;
+
+                    Text {
+                        text: "⚠";
+                        color: #ffaa00;
+                        font-size: 14px;
+                    }
+                    Text {
+                        text: "Ensure a blank CD-R is inserted";
+                        color: Theme.text-secondary;
+                        font-size: 12px;
+                    }
+                }
+
+                // Buttons
+                HorizontalLayout {
+                    spacing: 12px;
+                    alignment: center;
+
+                    // Cancel button
+                    Rectangle {
+                        width: 100px;
+                        height: 36px;
+                        border-radius: 6px;
+                        background: burn-cancel-config-touch.has-hover ? Theme.button-hover : Theme.button-background;
+
+                        burn-cancel-config-touch := TouchArea {
+                            clicked => { root.close-burn-dialog(); }
+                        }
+
+                        Text {
+                            text: "Cancel";
+                            color: Theme.text-primary;
+                            font-size: 14px;
+                            horizontal-alignment: center;
+                            vertical-alignment: center;
+                        }
+                    }
+
+                    // Burn button
+                    Rectangle {
+                        property <bool> enabled: root.burn-available-drives.length > 0;
+
+                        width: 100px;
+                        height: 36px;
+                        border-radius: 6px;
+                        background: !enabled ? Theme.button-background :
+                                   burn-start-touch.has-hover ? Theme.accent-hover : Theme.accent;
+                        opacity: enabled ? 1.0 : 0.5;
+
+                        burn-start-touch := TouchArea {
+                            enabled: parent.enabled;
+                            clicked => { root.start-burn(); }
+                        }
+
+                        Text {
+                            text: "Burn CD";
+                            color: Theme.text-primary;
+                            font-size: 14px;
+                            font-weight: 600;
+                            horizontal-alignment: center;
+                            vertical-alignment: center;
+                        }
+                    }
+                }
+            }
+
+            // Burning in progress view
+            if root.is-burning && !root.burn-complete && !root.burn-error: VerticalLayout {
+                padding: 24px;
+                spacing: 16px;
+
+                // Title
+                Text {
+                    text: "Burning CD...";
+                    color: Theme.text-primary;
+                    font-size: 18px;
+                    font-weight: 600;
+                    horizontal-alignment: center;
+                }
+
+                // Drive info
+                Text {
+                    text: root.burn-available-drives.length > 0 && root.burn-selected-drive-index >= 0 ?
+                          "Drive: " + root.burn-available-drives[root.burn-selected-drive-index].display-name : "";
+                    color: Theme.text-secondary;
+                    font-size: 13px;
+                    horizontal-alignment: center;
+                }
+
+                // Status
+                Text {
+                    text: root.burn-status;
+                    color: Theme.text-primary;
+                    font-size: 14px;
+                    horizontal-alignment: center;
+                }
+
+                // Progress bar
+                Rectangle {
+                    height: 8px;
+                    background: Theme.input-background;
+                    border-radius: 4px;
+
+                    Rectangle {
+                        x: 0;
+                        y: 0;
+                        width: parent.width * root.burn-progress;
+                        height: parent.height;
+                        background: Theme.accent;
+                        border-radius: 4px;
+                    }
+                }
+
+                // Progress percentage
+                Text {
+                    text: floor(root.burn-progress * 100) + "%";
+                    color: Theme.text-secondary;
+                    font-size: 12px;
+                    horizontal-alignment: center;
+                }
+
+                // Log output
+                VerticalLayout {
+                    spacing: 6px;
+
+                    Text {
+                        text: "Log:";
+                        color: Theme.text-secondary;
+                        font-size: 12px;
+                    }
+
+                    Rectangle {
+                        background: Theme.input-background;
+                        border-radius: 6px;
+                        height: 150px;
+
+                        ScrollView {
+                            VerticalLayout {
+                                padding: 8px;
+
+                                Text {
+                                    text: root.burn-log;
+                                    color: Theme.text-secondary;
+                                    font-size: 11px;
+                                    font-family: "monospace";
+                                    wrap: word-wrap;
+                                }
+                            }
+                        }
+                    }
+                }
+
+                // Cancel button during burning
+                HorizontalLayout {
+                    alignment: center;
+
+                    Rectangle {
+                        width: 100px;
+                        height: 36px;
+                        border-radius: 6px;
+                        background: burn-cancel-progress-touch.has-hover ? #cc4444 : #993333;
+
+                        burn-cancel-progress-touch := TouchArea {
+                            clicked => { root.cancel-burn(); }
+                        }
+
+                        Text {
+                            text: "Cancel";
+                            color: Theme.text-primary;
+                            font-size: 14px;
+                            horizontal-alignment: center;
+                            vertical-alignment: center;
+                        }
+                    }
+                }
+            }
+
+            // Complete/Error view
+            if root.burn-complete || root.burn-error: VerticalLayout {
+                padding: 24px;
+                spacing: 12px;
+
+                // Icon and title
+                HorizontalLayout {
+                    spacing: 12px;
+                    alignment: center;
+
+                    Text {
+                        text: root.burn-error ? "!" : "✓";
+                        color: root.burn-error ? #ff6b6b : #66cc66;
+                        font-size: 24px;
+                        font-weight: 700;
+                    }
+                    Text {
+                        text: root.burn-error ? "Burn Failed" : "Burn Complete";
+                        color: Theme.text-primary;
+                        font-size: 18px;
+                        font-weight: 600;
+                    }
+                }
+
+                // Result message
+                Text {
+                    text: root.burn-result-message;
+                    color: Theme.text-secondary;
+                    font-size: 14px;
+                    horizontal-alignment: center;
+                    wrap: word-wrap;
+                }
+
+                // Log output (only show on error, if there's log content)
+                if root.burn-error && root.burn-log != "": VerticalLayout {
+                    spacing: 6px;
+
+                    Text {
+                        text: "Log:";
+                        color: Theme.text-secondary;
+                        font-size: 12px;
+                    }
+
+                    Rectangle {
+                        background: Theme.input-background;
+                        border-radius: 6px;
+                        height: 150px;
+
+                        ScrollView {
+                            VerticalLayout {
+                                padding: 8px;
+
+                                Text {
+                                    text: root.burn-log;
+                                    color: Theme.text-secondary;
+                                    font-size: 11px;
+                                    font-family: "monospace";
+                                    wrap: word-wrap;
+                                }
+                            }
+                        }
+                    }
+                }
+
+                // Spacer (smaller when log is shown)
+                Rectangle {
+                    vertical-stretch: 1;
+                }
+
+                // OK button
+                HorizontalLayout {
+                    alignment: center;
+
+                    Rectangle {
+                        width: 100px;
+                        height: 36px;
+                        border-radius: 6px;
+                        background: burn-ok-touch.has-hover ? Theme.accent-hover : Theme.accent;
+
+                        burn-ok-touch := TouchArea {
+                            clicked => { root.close-burn-dialog(); }
                         }
 
                         Text {
