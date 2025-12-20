@@ -18,6 +18,7 @@ use redbookmaster_lib::audio::wav::{read_wav_info, WavInfo};
 use redbookmaster_lib::{generate_cue, generate_toc};
 use redbookmaster_lib::{Cdrdao, BurnOptions, cdrdao_available, list_drives};
 use slint::Model;
+use serde::{Deserialize, Serialize};
 
 use player::{AudioEngine, PlayerEvent};
 
@@ -25,6 +26,46 @@ slint::include_modules!();
 
 /// Number of waveform peaks to display
 const WAVEFORM_BINS: usize = 500;
+
+/// User preferences that persist between sessions
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+struct Preferences {
+    /// Last window width
+    window_width: Option<u32>,
+    /// Last window height
+    window_height: Option<u32>,
+    /// Last opened project directory
+    last_project_dir: Option<PathBuf>,
+}
+
+impl Preferences {
+    /// Get the preferences file path
+    fn file_path() -> Option<PathBuf> {
+        dirs::config_dir().map(|p| p.join("redbookmaster").join("preferences.json"))
+    }
+
+    /// Load preferences from disk
+    fn load() -> Self {
+        Self::file_path()
+            .and_then(|path| std::fs::read_to_string(&path).ok())
+            .and_then(|contents| serde_json::from_str(&contents).ok())
+            .unwrap_or_default()
+    }
+
+    /// Save preferences to disk
+    fn save(&self) {
+        if let Some(path) = Self::file_path() {
+            // Create directory if needed
+            if let Some(parent) = path.parent() {
+                let _ = std::fs::create_dir_all(parent);
+            }
+            // Write preferences
+            if let Ok(contents) = serde_json::to_string_pretty(self) {
+                let _ = std::fs::write(&path, contents);
+            }
+        }
+    }
+}
 
 /// Application state
 struct AppState {
@@ -42,6 +83,10 @@ struct AppState {
     scroll_offset: f32,
     /// Files pending transcoding (path, wav_info)
     pending_transcode_files: Vec<(PathBuf, WavInfo)>,
+    /// User preferences
+    preferences: Preferences,
+    /// Last saved window size (for change detection)
+    last_saved_window_size: Option<(u32, u32)>,
 }
 
 /// Cached waveform data
@@ -53,6 +98,11 @@ struct WaveformCache {
 
 impl AppState {
     fn new() -> Self {
+        let prefs = Preferences::load();
+        let last_size = match (prefs.window_width, prefs.window_height) {
+            (Some(w), Some(h)) => Some((w, h)),
+            _ => None,
+        };
         Self {
             project: None,
             project_path: None,
@@ -63,7 +113,18 @@ impl AppState {
             zoom_level: 1.0,
             scroll_offset: 0.0,
             pending_transcode_files: Vec::new(),
+            preferences: prefs,
+            last_saved_window_size: last_size,
         }
+    }
+
+    fn save_preferences(&mut self) {
+        // Update last saved size
+        self.last_saved_window_size = match (self.preferences.window_width, self.preferences.window_height) {
+            (Some(w), Some(h)) => Some((w, h)),
+            _ => None,
+        };
+        self.preferences.save();
     }
 
     fn tracks_to_model(&self) -> Vec<TrackData> {
@@ -156,6 +217,18 @@ fn main() -> Result<(), slint::PlatformError> {
     let app = MainWindow::new()?;
     let state = Rc::new(RefCell::new(AppState::new()));
 
+    // Apply saved window size from preferences
+    {
+        let state_ref = state.borrow();
+        if let (Some(width), Some(height)) = (
+            state_ref.preferences.window_width,
+            state_ref.preferences.window_height,
+        ) {
+            let size = slint::LogicalSize::new(width as f32, height as f32);
+            app.window().set_size(size);
+        }
+    }
+
     // Initialize audio engine
     let audio_engine = match AudioEngine::new() {
         Ok(engine) => Arc::new(engine),
@@ -172,11 +245,21 @@ fn main() -> Result<(), slint::PlatformError> {
     let app_weak = app.as_weak();
     let state_clone = state.clone();
     app.on_new_project(move || {
+        // Use last project directory if available
+        let last_dir = {
+            let state = state_clone.borrow();
+            state.preferences.last_project_dir.clone()
+        };
+
         // Show save file dialog - user picks name and location
-        let dialog = rfd::FileDialog::new()
+        let mut dialog = rfd::FileDialog::new()
             .set_title("Create New Project")
             .add_filter("Red Book Master Project", &["rbm"])
             .set_file_name("untitled.rbm");
+
+        if let Some(ref dir) = last_dir {
+            dialog = dialog.set_directory(dir);
+        }
 
         if let Some(path) = dialog.save_file() {
             // Get project name from the chosen filename (without extension)
@@ -225,6 +308,17 @@ fn main() -> Result<(), slint::PlatformError> {
             state.zoom_level = 1.0;
             state.scroll_offset = 0.0;
 
+            // Save last project directory and window size
+            state.preferences.last_project_dir = Some(parent_dir.to_path_buf());
+            if let Some(app) = app_weak.upgrade() {
+                // Convert physical pixels to logical pixels for cross-DPI consistency
+                let size = app.window().size();
+                let scale = app.window().scale_factor();
+                state.preferences.window_width = Some((size.width as f32 / scale) as u32);
+                state.preferences.window_height = Some((size.height as f32 / scale) as u32);
+            }
+            state.save_preferences();
+
             if let Some(app) = app_weak.upgrade() {
                 let tracks: Vec<TrackData> = state.tracks_to_model();
                 let model = Rc::new(slint::VecModel::from(tracks));
@@ -243,9 +337,19 @@ fn main() -> Result<(), slint::PlatformError> {
     let app_weak = app.as_weak();
     let state_clone = state.clone();
     app.on_open_project(move || {
-        let dialog = rfd::FileDialog::new()
+        // Use last project directory if available
+        let last_dir = {
+            let state = state_clone.borrow();
+            state.preferences.last_project_dir.clone()
+        };
+
+        let mut dialog = rfd::FileDialog::new()
             .add_filter("Red Book Master Project", &["rbm"])
             .set_title("Open Project");
+
+        if let Some(ref dir) = last_dir {
+            dialog = dialog.set_directory(dir);
+        }
 
         if let Some(path) = dialog.pick_file() {
             match Project::load(&path) {
@@ -255,6 +359,19 @@ fn main() -> Result<(), slint::PlatformError> {
                     state.project_path = Some(path.clone());
                     state.waveform_cache.clear();
                     state.displayed_track_num = None;
+
+                    // Save last project directory
+                    if let Some(parent) = path.parent() {
+                        state.preferences.last_project_dir = Some(parent.to_path_buf());
+                    }
+                    // Save window size (convert physical to logical pixels)
+                    if let Some(app) = app_weak.upgrade() {
+                        let size = app.window().size();
+                        let scale = app.window().scale_factor();
+                        state.preferences.window_width = Some((size.width as f32 / scale) as u32);
+                        state.preferences.window_height = Some((size.height as f32 / scale) as u32);
+                    }
+                    state.save_preferences();
 
                     if let Some(app) = app_weak.upgrade() {
                         let tracks: Vec<TrackData> = state.tracks_to_model();
@@ -1595,6 +1712,8 @@ fn main() -> Result<(), slint::PlatformError> {
     let completed_for_timer = completed_conversions.clone();
     let done_for_timer = conversion_done.clone();
     let waveform_result_for_timer = waveform_result.clone();
+    // Counter for periodic window size check (every ~2 seconds = 40 ticks at 50ms)
+    let window_check_counter = Rc::new(std::cell::Cell::new(0u32));
     let timer = slint::Timer::default();
     timer.start(
         slint::TimerMode::Repeated,
@@ -1765,6 +1884,28 @@ fn main() -> Result<(), slint::PlatformError> {
                     }
                     PlayerEvent::Error(msg) => {
                         app.set_status_message(format!("Error: {}", msg).into());
+                    }
+                }
+            }
+
+            // Periodic window size check (every ~2 seconds)
+            let count = window_check_counter.get() + 1;
+            window_check_counter.set(count);
+            if count % 40 == 0 {
+                if let Some(app) = app_weak.upgrade() {
+                    let size = app.window().size();
+                    let scale = app.window().scale_factor();
+                    let logical_width = (size.width as f32 / scale) as u32;
+                    let logical_height = (size.height as f32 / scale) as u32;
+
+                    let mut state = state_for_timer.borrow_mut();
+                    let current_size = (logical_width, logical_height);
+                    let size_changed = state.last_saved_window_size != Some(current_size);
+
+                    if size_changed {
+                        state.preferences.window_width = Some(logical_width);
+                        state.preferences.window_height = Some(logical_height);
+                        state.save_preferences();
                     }
                 }
             }
