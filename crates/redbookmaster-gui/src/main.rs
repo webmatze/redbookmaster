@@ -272,7 +272,9 @@ fn main() -> Result<(), slint::PlatformError> {
                 Err(e) => {
                     eprintln!("Failed to open project: {}", e);
                     if let Some(app) = app_weak.upgrade() {
-                        app.set_status_message(format!("Error: {}", e).into());
+                        app.set_error_title("Open Failed".into());
+                        app.set_error_message(format!("Failed to open project:\n{}", e).into());
+                        app.set_show_error_dialog(true);
                     }
                 }
             }
@@ -888,7 +890,9 @@ fn main() -> Result<(), slint::PlatformError> {
         let state = state_clone.borrow();
         let Some(ref project) = state.project else {
             if let Some(app) = app_weak.upgrade() {
-                app.set_status_message("No project to export".into());
+                app.set_error_title("Export Error".into());
+                app.set_error_message("No project to export. Create or open a project first.".into());
+                app.set_show_error_dialog(true);
             }
             return;
         };
@@ -896,14 +900,18 @@ fn main() -> Result<(), slint::PlatformError> {
         // Require project directory
         let Some(ref project_dir) = project.project_dir else {
             if let Some(app) = app_weak.upgrade() {
-                app.set_status_message("No project directory - save project first".into());
+                app.set_error_title("Export Error".into());
+                app.set_error_message("No project directory. Save the project first.".into());
+                app.set_show_error_dialog(true);
             }
             return;
         };
 
         if project.album.tracks.is_empty() {
             if let Some(app) = app_weak.upgrade() {
-                app.set_status_message("No tracks to export".into());
+                app.set_error_title("Export Error".into());
+                app.set_error_message("No tracks to export. Add some tracks first.".into());
+                app.set_show_error_dialog(true);
             }
             return;
         }
@@ -911,7 +919,9 @@ fn main() -> Result<(), slint::PlatformError> {
         // Validate album
         if let Err(e) = project.album.validate() {
             if let Some(app) = app_weak.upgrade() {
-                app.set_status_message(format!("Validation failed: {}", e).into());
+                app.set_error_title("Validation Error".into());
+                app.set_error_message(format!("{}", e).into());
+                app.set_show_error_dialog(true);
             }
             return;
         }
@@ -946,7 +956,9 @@ fn main() -> Result<(), slint::PlatformError> {
 
         if let Err(e) = concatenate_tracks(&resolved_tracks, &wav_path) {
             if let Some(app) = app_weak.upgrade() {
-                app.set_status_message(format!("Export failed: {}", e).into());
+                app.set_error_title("Export Failed".into());
+                app.set_error_message(format!("Failed to create master WAV: {}", e).into());
+                app.set_show_error_dialog(true);
             }
             return;
         }
@@ -959,7 +971,9 @@ fn main() -> Result<(), slint::PlatformError> {
         let wav_filename = wav_path.file_name().unwrap().to_str().unwrap();
         if let Err(e) = generate_cue(&project.album, wav_filename, &cue_path) {
             if let Some(app) = app_weak.upgrade() {
-                app.set_status_message(format!("CUE generation failed: {}", e).into());
+                app.set_error_title("Export Failed".into());
+                app.set_error_message(format!("Failed to generate CUE sheet: {}", e).into());
+                app.set_show_error_dialog(true);
             }
             return;
         }
@@ -971,7 +985,9 @@ fn main() -> Result<(), slint::PlatformError> {
 
         if let Err(e) = generate_toc(&project.album, wav_filename, &toc_path) {
             if let Some(app) = app_weak.upgrade() {
-                app.set_status_message(format!("TOC generation failed: {}", e).into());
+                app.set_error_title("Export Failed".into());
+                app.set_error_message(format!("Failed to generate TOC file: {}", e).into());
+                app.set_show_error_dialog(true);
             }
             return;
         }
@@ -988,7 +1004,9 @@ fn main() -> Result<(), slint::PlatformError> {
         // Check if cdrdao is available
         if !cdrdao_available() {
             if let Some(app) = app_weak.upgrade() {
-                app.set_status_message("cdrdao not installed. Install it with: brew install cdrdao".into());
+                app.set_error_title("cdrdao Not Found".into());
+                app.set_error_message("cdrdao is required for CD burning.\n\nInstall it with: brew install cdrdao".into());
+                app.set_show_error_dialog(true);
             }
             return;
         }
@@ -996,14 +1014,18 @@ fn main() -> Result<(), slint::PlatformError> {
         let state = state_clone.borrow();
         let Some(ref project) = state.project else {
             if let Some(app) = app_weak.upgrade() {
-                app.set_status_message("No project loaded".into());
+                app.set_error_title("Burn Error".into());
+                app.set_error_message("No project loaded. Create or open a project first.".into());
+                app.set_show_error_dialog(true);
             }
             return;
         };
 
         if project.album.tracks.is_empty() {
             if let Some(app) = app_weak.upgrade() {
-                app.set_status_message("No tracks to burn".into());
+                app.set_error_title("Burn Error".into());
+                app.set_error_message("No tracks to burn. Add some tracks first.".into());
+                app.set_show_error_dialog(true);
             }
             return;
         }
@@ -1058,7 +1080,9 @@ fn main() -> Result<(), slint::PlatformError> {
 
         if drives.is_empty() {
             if let Some(app) = app_weak.upgrade() {
-                app.set_status_message("No CD drives found. Please close any disc dialogs and try again.".into());
+                app.set_error_title("No CD Drive Found".into());
+                app.set_error_message("No CD drives detected.\n\nPlease ensure a CD drive is connected and close any system disc dialogs.".into());
+                app.set_show_error_dialog(true);
             }
             return;
         }
@@ -1074,7 +1098,9 @@ fn main() -> Result<(), slint::PlatformError> {
 
         if !toc_path.exists() {
             if let Some(app) = app_weak.upgrade() {
-                app.set_status_message("TOC file not found. Please export first.".into());
+                app.set_error_title("File Not Found".into());
+                app.set_error_message("TOC file not found. Please export the project first.".into());
+                app.set_show_error_dialog(true);
             }
             return;
         }
@@ -1179,17 +1205,23 @@ fn main() -> Result<(), slint::PlatformError> {
 
                 if let Some(app) = app_weak.upgrade() {
                     if error_str.contains("Device already in use") || error_str.contains("Cannot grab") {
-                        app.set_status_message("Drive is busy. Close any disc dialogs and try again.".into());
+                        app.set_error_title("Drive Busy".into());
+                        app.set_error_message("The CD drive is in use by another application.\n\nClose any Finder windows showing the disc and try again.".into());
+                        app.set_show_error_dialog(true);
                     } else if error_str.contains("Write data failed") {
-                        app.set_status_message("Write failed. Try with CD-TEXT disabled or run with sudo. See console.".into());
+                        app.set_error_title("Burn Failed".into());
+                        app.set_error_message("Write failed during burning.\n\nTry:\n• Burning with CD-TEXT disabled\n• Using a different CD-R disc\n• Running with sudo".into());
+                        app.set_show_error_dialog(true);
                     } else {
-                        // Show first 150 chars of error in status bar
-                        let short_error = if error_str.len() > 150 {
-                            format!("{}... (see console)", &error_str[..150])
+                        app.set_error_title("Burn Failed".into());
+                        // Truncate long error messages
+                        let msg = if error_str.len() > 200 {
+                            format!("{}...\n\nSee console for details.", &error_str[..200])
                         } else {
                             error_str
                         };
-                        app.set_status_message(format!("Burn failed: {}", short_error).into());
+                        app.set_error_message(msg.into());
+                        app.set_show_error_dialog(true);
                     }
                 }
             }
@@ -1229,7 +1261,9 @@ fn main() -> Result<(), slint::PlatformError> {
                 }
                 Err(e) => {
                     if let Some(app) = app_weak.upgrade() {
-                        app.set_status_message(format!("Save failed: {}", e).into());
+                        app.set_error_title("Save Failed".into());
+                        app.set_error_message(format!("Failed to save project:\n{}", e).into());
+                        app.set_show_error_dialog(true);
                     }
                 }
             }
@@ -1427,6 +1461,14 @@ fn main() -> Result<(), slint::PlatformError> {
         if let Some(app) = app_weak.upgrade() {
             app.set_show_transcode_dialog(false);
             app.set_status_message("Conversion cancelled".into());
+        }
+    });
+
+    // Dismiss error dialog
+    let app_weak = app.as_weak();
+    app.on_dismiss_error(move || {
+        if let Some(app) = app_weak.upgrade() {
+            app.set_show_error_dialog(false);
         }
     });
 

@@ -243,6 +243,12 @@ export component MainWindow inherits Window {
     in property <float> transcode-progress: 0.0;
     in property <bool> is-transcoding: false;
 
+    // Error dialog state
+    in property <bool> show-error-dialog: false;
+    in property <string> error-title: "Error";
+    in property <string> error-message: "";
+    callback dismiss-error();
+
     // Project state - controls which UI elements are enabled
     in property <bool> has-project: false;
 
@@ -1400,6 +1406,93 @@ export component MainWindow inherits Window {
 
                         Text {
                             text: root.is-transcoding ? "Converting..." : "Convert";
+                            color: Theme.text-primary;
+                            font-size: 14px;
+                            font-weight: 600;
+                            horizontal-alignment: center;
+                            vertical-alignment: center;
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    // Error dialog overlay
+    if root.show-error-dialog: Rectangle {
+        x: 0;
+        y: 0;
+        width: 100%;
+        height: 100%;
+        background: #000000aa;
+
+        // Block clicks on background
+        TouchArea {}
+
+        // Dialog panel
+        Rectangle {
+            width: 400px;
+            height: 200px;
+            x: (parent.width - self.width) / 2;
+            y: (parent.height - self.height) / 2;
+            background: Theme.panel-background;
+            border-radius: 12px;
+            border-width: 1px;
+            border-color: Theme.panel-border;
+
+            VerticalLayout {
+                padding: 24px;
+                spacing: 16px;
+
+                // Error icon and title
+                HorizontalLayout {
+                    spacing: 12px;
+                    alignment: center;
+
+                    Text {
+                        text: "!";
+                        color: #ff6b6b;
+                        font-size: 24px;
+                        font-weight: 700;
+                    }
+                    Text {
+                        text: root.error-title;
+                        color: Theme.text-primary;
+                        font-size: 18px;
+                        font-weight: 600;
+                    }
+                }
+
+                // Error message
+                Text {
+                    text: root.error-message;
+                    color: Theme.text-secondary;
+                    font-size: 14px;
+                    horizontal-alignment: center;
+                    wrap: word-wrap;
+                }
+
+                // Spacer
+                Rectangle {
+                    vertical-stretch: 1;
+                }
+
+                // OK button
+                HorizontalLayout {
+                    alignment: center;
+
+                    Rectangle {
+                        width: 100px;
+                        height: 36px;
+                        border-radius: 6px;
+                        background: ok-touch.has-hover ? Theme.accent-hover : Theme.accent;
+
+                        ok-touch := TouchArea {
+                            clicked => { root.dismiss-error(); }
+                        }
+
+                        Text {
+                            text: "OK";
                             color: Theme.text-primary;
                             font-size: 14px;
                             font-weight: 600;
