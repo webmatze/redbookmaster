@@ -34,6 +34,25 @@ fn show_error_dialog(app: &MainWindow, title: &str, message: &str) {
     app.set_show_error_dialog(true);
 }
 
+/// Unmount any mounted optical discs on macOS
+/// This is required before cdrdao can access the drive
+#[cfg(target_os = "macos")]
+fn unmount_optical_discs() {
+    if let Ok(output) = std::process::Command::new("diskutil").args(["list"]).output() {
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        for line in stdout.lines() {
+            // Skip disk0 (system disk) and look for optical disc entries
+            if line.contains("/dev/disk") && !line.contains("disk0") {
+                if let Some(disk) = line.split_whitespace().next() {
+                    let _ = std::process::Command::new("diskutil")
+                        .args(["unmountDisk", disk])
+                        .output();
+                }
+            }
+        }
+    }
+}
+
 /// User preferences that persist between sessions
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 struct Preferences {
@@ -1217,19 +1236,7 @@ fn main() -> Result<(), slint::PlatformError> {
             if let Some(app) = app_weak.upgrade() {
                 app.set_status_message("Detecting CD drives...".into());
             }
-            // Find and unmount optical discs using diskutil
-            if let Ok(output) = std::process::Command::new("diskutil").args(["list"]).output() {
-                let stdout = String::from_utf8_lossy(&output.stdout);
-                for line in stdout.lines() {
-                    if line.contains("/dev/disk") && !line.contains("disk0") {
-                        if let Some(disk) = line.split_whitespace().next() {
-                            let _ = std::process::Command::new("diskutil")
-                                .args(["unmountDisk", disk])
-                                .output();
-                        }
-                    }
-                }
-            }
+            unmount_optical_discs();
         }
 
         // List available CD drives
@@ -1442,20 +1449,7 @@ fn main() -> Result<(), slint::PlatformError> {
 
         // On macOS, unmount discs before burning
         #[cfg(target_os = "macos")]
-        {
-            if let Ok(output) = std::process::Command::new("diskutil").args(["list"]).output() {
-                let stdout = String::from_utf8_lossy(&output.stdout);
-                for line in stdout.lines() {
-                    if line.contains("/dev/disk") && !line.contains("disk0") {
-                        if let Some(disk) = line.split_whitespace().next() {
-                            let _ = std::process::Command::new("diskutil")
-                                .args(["unmountDisk", disk])
-                                .output();
-                        }
-                    }
-                }
-            }
-        }
+        unmount_optical_discs();
 
         // Clone shared state for thread
         let burn_log_thread = burn_log_clone.clone();
