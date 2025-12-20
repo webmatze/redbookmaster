@@ -1256,7 +1256,18 @@ fn main() -> Result<(), slint::PlatformError> {
             app.set_burn_selected_speed_index(0);
             app.set_burn_eject(true);
             app.set_burn_cd_text(false);
+            app.set_cd_text_driver_index(0);  // Default to Auto
             app.set_burn_simulate(false);
+
+            // Set CD-TEXT driver options
+            let driver_labels: Vec<slint::SharedString> = vec![
+                "Auto".into(),
+                "Raw Mode".into(),
+                "Sub-channel Mode".into(),
+                "CUE Sheet Mode (Pioneer)".into(),
+            ];
+            let driver_labels_model: Rc<slint::VecModel<slint::SharedString>> = Rc::new(slint::VecModel::from(driver_labels));
+            app.set_cd_text_driver_labels(driver_labels_model.into());
 
             // Set drives and speed options
             let drives_model: Rc<slint::VecModel<CdDriveInfo>> = Rc::new(slint::VecModel::from(slint_drives));
@@ -1294,7 +1305,7 @@ fn main() -> Result<(), slint::PlatformError> {
     let burn_child_clone = burn_child_process.clone();
     app.on_start_burn(move || {
         // Get burn settings from UI
-        let (device, speed, eject, cd_text, simulate, toc_path) = {
+        let (device, speed, eject, cd_text, cd_text_driver_index, simulate, toc_path) = {
             let state = state_clone.borrow();
             let Some(ref project) = state.project else { return; };
             let Some(ref project_dir) = project.project_dir else { return; };
@@ -1308,6 +1319,7 @@ fn main() -> Result<(), slint::PlatformError> {
             let speed_idx = app.get_burn_selected_speed_index() as usize;
             let eject = app.get_burn_eject();
             let cd_text = app.get_burn_cd_text();
+            let cd_text_driver_index = app.get_cd_text_driver_index();
             let simulate = app.get_burn_simulate();
 
             // Get drive device from available drives
@@ -1334,7 +1346,7 @@ fn main() -> Result<(), slint::PlatformError> {
             let base_name = if base_name.is_empty() { "master".to_string() } else { base_name };
             let toc_path = project_dir.join(format!("{}.toc", base_name));
 
-            (device, speed, eject, cd_text, simulate, toc_path)
+            (device, speed, eject, cd_text, cd_text_driver_index, simulate, toc_path)
         };
 
         if !toc_path.exists() {
@@ -1389,11 +1401,32 @@ fn main() -> Result<(), slint::PlatformError> {
 
         // Spawn burn thread
         std::thread::spawn(move || {
+            // Determine driver arguments based on CD-TEXT settings
+            let driver_args: Option<(&str, &str)> = if cd_text {
+                match cd_text_driver_index {
+                    0 => None,  // Auto - no driver flag
+                    1 => Some(("--driver", "generic-mmc-raw")),
+                    2 => Some(("--driver", "generic-mmc:0x10")),
+                    3 => Some(("--driver", "generic-mmc:0x20000")),
+                    _ => None,
+                }
+            } else {
+                None
+            };
+
+            let driver_label = match cd_text_driver_index {
+                0 => "Auto",
+                1 => "Raw Mode",
+                2 => "Sub-channel Mode",
+                3 => "CUE Sheet Mode",
+                _ => "Auto",
+            };
+
             println!("=== Starting CD burn ===");
             println!("TOC file: {}", toc_path.display());
             println!("Device: {}", device);
             println!("Speed: {} (0=auto)", speed);
-            println!("CD-TEXT: {}", if cd_text { "Enabled" } else { "Disabled" });
+            println!("CD-TEXT: {}", if cd_text { format!("Enabled ({})", driver_label) } else { "Disabled".to_string() });
             println!("Simulate: {}", simulate);
             println!("========================");
 
@@ -1401,8 +1434,8 @@ fn main() -> Result<(), slint::PlatformError> {
             let mut cmd = std::process::Command::new("cdrdao");
             cmd.arg("write");
             cmd.arg("--device").arg(&device);
-            if cd_text {
-                cmd.arg("--driver").arg("generic-mmc-raw");
+            if let Some((flag, value)) = driver_args {
+                cmd.arg(flag).arg(value);
             }
             if speed > 0 {
                 cmd.arg("--speed").arg(speed.to_string());

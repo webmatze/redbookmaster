@@ -1388,7 +1388,7 @@ fn export_master(project: &mut Project) {
 
 /// Burn CD using cdrdao
 fn burn_cd(project: &mut Project) {
-    use cdrdao::{BurnOptions, Cdrdao, CdDrive};
+    use cdrdao::{BurnOptions, CdTextDriver, Cdrdao, CdDrive};
 
     println!();
     println!("{}", "Burn CD".bold().green());
@@ -1629,12 +1629,13 @@ fn burn_cd(project: &mut Project) {
     };
 
     // Create burn options
+    // Using GenericMmcRaw for CD-TEXT support (previous default behavior)
     let options = BurnOptions {
         device: drive.device.clone(),
         speed,
         simulate: false,
         eject: true,
-        force_raw_driver: true,
+        cd_text_driver: CdTextDriver::GenericMmcRaw,
     };
 
     let burner = Cdrdao::new(options);

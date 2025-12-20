@@ -70,6 +70,69 @@ pub struct CdDrive {
     pub model: String,
 }
 
+/// CD-TEXT driver mode for burning
+/// Different drives require different driver configurations for CD-TEXT support
+#[derive(Debug, Clone, Default, PartialEq)]
+pub enum CdTextDriver {
+    /// No CD-TEXT - burn audio only without metadata
+    Disabled,
+    /// Let cdrdao auto-detect the driver (no --driver flag)
+    #[default]
+    Auto,
+    /// Use generic-mmc-raw driver (common for CD-TEXT)
+    GenericMmcRaw,
+    /// Use generic-mmc with 0x10 flag (force R-W sub-channel writing)
+    GenericMmcSubchannel,
+    /// Use generic-mmc with 0x20000 flag (force CUE sheet, for some Pioneer drives)
+    GenericMmcCueSheet,
+}
+
+impl CdTextDriver {
+    /// Get the driver arguments for cdrdao
+    pub fn driver_args(&self) -> Option<(&'static str, &'static str)> {
+        match self {
+            CdTextDriver::Disabled => None,
+            CdTextDriver::Auto => None,
+            CdTextDriver::GenericMmcRaw => Some(("--driver", "generic-mmc-raw")),
+            CdTextDriver::GenericMmcSubchannel => Some(("--driver", "generic-mmc:0x10")),
+            CdTextDriver::GenericMmcCueSheet => Some(("--driver", "generic-mmc:0x20000")),
+        }
+    }
+
+    /// Get a human-readable label for this driver mode
+    pub fn label(&self) -> &'static str {
+        match self {
+            CdTextDriver::Disabled => "Disabled",
+            CdTextDriver::Auto => "Auto",
+            CdTextDriver::GenericMmcRaw => "Raw Mode",
+            CdTextDriver::GenericMmcSubchannel => "Sub-channel Mode",
+            CdTextDriver::GenericMmcCueSheet => "CUE Sheet Mode",
+        }
+    }
+
+    /// Get a description for this driver mode
+    pub fn description(&self) -> &'static str {
+        match self {
+            CdTextDriver::Disabled => "No CD-TEXT metadata",
+            CdTextDriver::Auto => "Let cdrdao auto-detect driver",
+            CdTextDriver::GenericMmcRaw => "generic-mmc-raw (most compatible)",
+            CdTextDriver::GenericMmcSubchannel => "generic-mmc:0x10 (force sub-channel)",
+            CdTextDriver::GenericMmcCueSheet => "generic-mmc:0x20000 (Pioneer drives)",
+        }
+    }
+
+    /// Create from index (for UI dropdown)
+    pub fn from_index(index: i32) -> Self {
+        match index {
+            0 => CdTextDriver::Auto,
+            1 => CdTextDriver::GenericMmcRaw,
+            2 => CdTextDriver::GenericMmcSubchannel,
+            3 => CdTextDriver::GenericMmcCueSheet,
+            _ => CdTextDriver::Auto,
+        }
+    }
+}
+
 /// List available CD drives
 pub fn list_drives() -> Result<Vec<CdDrive>, CdrdaoError> {
     let mut cmd = cdrdao_command().ok_or(CdrdaoError::NotInstalled)?;
@@ -136,8 +199,8 @@ pub struct BurnOptions {
     pub simulate: bool,
     /// Eject disc after burning
     pub eject: bool,
-    /// Use generic-mmc-raw driver for CD-TEXT support
-    pub force_raw_driver: bool,
+    /// CD-TEXT driver mode
+    pub cd_text_driver: CdTextDriver,
 }
 
 impl Default for BurnOptions {
@@ -147,7 +210,7 @@ impl Default for BurnOptions {
             speed: 0,
             simulate: false,
             eject: true,
-            force_raw_driver: true,
+            cd_text_driver: CdTextDriver::Auto,
         }
     }
 }
@@ -171,9 +234,9 @@ impl Cdrdao {
         args.push(&self.options.device);
 
         // Driver for CD-TEXT support
-        if self.options.force_raw_driver {
-            args.push("--driver");
-            args.push("generic-mmc-raw");
+        if let Some((flag, value)) = self.options.cd_text_driver.driver_args() {
+            args.push(flag);
+            args.push(value);
         }
 
         // Speed
@@ -295,8 +358,35 @@ mod tests {
     fn test_default_options() {
         let options = BurnOptions::default();
         assert!(options.eject);
-        assert!(options.force_raw_driver);
+        assert_eq!(options.cd_text_driver, CdTextDriver::Auto);
         assert!(!options.simulate);
+    }
+
+    #[test]
+    fn test_cd_text_driver_args() {
+        assert_eq!(CdTextDriver::Disabled.driver_args(), None);
+        assert_eq!(CdTextDriver::Auto.driver_args(), None);
+        assert_eq!(
+            CdTextDriver::GenericMmcRaw.driver_args(),
+            Some(("--driver", "generic-mmc-raw"))
+        );
+        assert_eq!(
+            CdTextDriver::GenericMmcSubchannel.driver_args(),
+            Some(("--driver", "generic-mmc:0x10"))
+        );
+        assert_eq!(
+            CdTextDriver::GenericMmcCueSheet.driver_args(),
+            Some(("--driver", "generic-mmc:0x20000"))
+        );
+    }
+
+    #[test]
+    fn test_cd_text_driver_from_index() {
+        assert_eq!(CdTextDriver::from_index(0), CdTextDriver::Auto);
+        assert_eq!(CdTextDriver::from_index(1), CdTextDriver::GenericMmcRaw);
+        assert_eq!(CdTextDriver::from_index(2), CdTextDriver::GenericMmcSubchannel);
+        assert_eq!(CdTextDriver::from_index(3), CdTextDriver::GenericMmcCueSheet);
+        assert_eq!(CdTextDriver::from_index(99), CdTextDriver::Auto); // Invalid defaults to Auto
     }
 
     #[test]

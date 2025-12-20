@@ -12,6 +12,7 @@ export global Theme {
     out property <color> accent-hover: #0080ff;
     out property <color> text-primary: #ffffff;
     out property <color> text-secondary: #a0a0a0;
+    out property <color> text-disabled: #606060;
     out property <color> text-dimmed: #606060;
     out property <color> waveform-fill: #0066cc60;
     out property <color> waveform-stroke: #0088ff;
@@ -273,6 +274,8 @@ export component MainWindow inherits Window {
     in-out property <int> burn-selected-speed-index: 0;
     in-out property <bool> burn-eject: true;
     in-out property <bool> burn-cd-text: false;
+    in property <[string]> cd-text-driver-labels: [];  // Driver options when CD-TEXT is enabled
+    in-out property <int> cd-text-driver-index: 0;     // Selected driver: 0=Auto, 1=Raw, 2=Sub-channel, 3=CUE Sheet
     in-out property <bool> burn-simulate: false;
 
     // Burn progress state
@@ -1558,7 +1561,7 @@ export component MainWindow inherits Window {
 
         // Dialog panel - dynamic height based on state
         Rectangle {
-            property <length> config-height: 380px;
+            property <length> config-height: 410px;
             property <length> burning-height: 450px;
             property <length> complete-height: 200px;
             property <length> error-with-log-height: 400px;
@@ -1690,10 +1693,31 @@ export component MainWindow inherits Window {
                         }
 
                         Text {
-                            text: "Enable CD-TEXT (may fail on some drives)";
+                            text: "Enable CD-TEXT";
                             color: Theme.text-primary;
                             font-size: 13px;
                             vertical-alignment: center;
+                        }
+                    }
+
+                    // CD-TEXT driver dropdown (always visible, disabled when CD-TEXT is off)
+                    HorizontalLayout {
+                        spacing: 8px;
+                        padding-left: 26px;  // Indent to align with checkbox content
+
+                        Text {
+                            text: "Driver:";
+                            color: root.burn-cd-text ? Theme.text-secondary : Theme.text-disabled;
+                            font-size: 13px;
+                            vertical-alignment: center;
+                            width: 50px;
+                        }
+
+                        ComboBox {
+                            width: 220px;
+                            model: root.cd-text-driver-labels;
+                            current-index <=> root.cd-text-driver-index;
+                            enabled: root.burn-cd-text;
                         }
                     }
 
