@@ -368,7 +368,13 @@ Window size is saved to `~/Library/Application Support/redbookmaster/preferences
 
 ## License
 
-MIT
+This software is licensed under a **Personal Use License**. You are free to use, modify, and share the software for personal, educational, or internal business purposes at no cost.
+
+**You may NOT** sell, commercially distribute, or bundle this software with paid products.
+
+For commercial licensing inquiries, contact: mathias.karstaedt@gmail.com
+
+See the [LICENSE](LICENSE) file for full terms.
 
 ## Contributing
 

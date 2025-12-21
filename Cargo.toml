@@ -10,7 +10,7 @@ members = [
 version = "0.1.0"
 edition = "2021"
 authors = ["Mathias Karstaedt"]
-license = "MIT"
+license-file = "LICENSE"
 repository = "https://github.com/webmatze/redbookmaster"
 
 [profile.release]
