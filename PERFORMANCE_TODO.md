@@ -18,15 +18,6 @@ _All high priority items completed - see Completed section._
 
 ## Priority 3 - Medium (Optimization Opportunities)
 
-### [ ] Investigate SIMD for peak extraction
-**File:** `crates/redbookmaster-lib/src/audio/waveform.rs` (lines 144-154)
-
-**Issue:** Peak extraction uses scalar operations. Modern CPUs can process 4-8 samples simultaneously with SIMD.
-
-**Recommendation:** Use SIMD intrinsics or a crate like `wide` for vectorized min/max operations.
-
----
-
 ### [ ] Reuse allocation in get_peaks_for_range
 **File:** `crates/redbookmaster-lib/src/audio/waveform.rs` (lines 34-73)
 
@@ -170,6 +161,17 @@ Implemented threshold-based position event sending:
 - Reduces position events from 20/sec to ~10/sec (50% reduction)
 - Reset threshold tracking on seek and track finish for immediate UI feedback
 - UI progress bar remains smooth while reducing channel traffic
+
+---
+
+### [x] Optimize peak extraction for auto-vectorization (Priority 3 - Medium)
+**File:** `crates/redbookmaster-lib/src/audio/waveform.rs`
+
+Optimized peak extraction with auto-vectorizable patterns:
+- **`get_peaks_for_range`**: Changed to iterator `map().collect()` with `fold` pattern for min/max reduction - LLVM auto-vectorizes this pattern effectively
+- **Streaming extraction**: Pre-compute division constants (`inv_max`, `inv_channels`) - multiplications are faster than divisions in the hot path
+- Added `#[inline]` hints to help compiler optimization
+- Note: Explicit SIMD for streaming would require buffering which defeats memory-efficiency; streaming is I/O bound anyway
 
 ---
 
