@@ -109,12 +109,15 @@ enum PendingWarningAction {
     Burn,
 }
 
+/// Maximum number of waveforms to cache (LRU eviction beyond this)
+const MAX_WAVEFORM_CACHE_SIZE: usize = 20;
+
 /// Application state
 struct AppState {
     project: Option<Project>,
     project_path: Option<PathBuf>,
-    /// Multi-track waveform cache (track_number -> cache)
-    waveform_cache: HashMap<u8, WaveformCache>,
+    /// Multi-track waveform cache with LRU eviction
+    waveform_cache: LruWaveformCache,
     /// Currently displayed track number
     displayed_track_num: Option<u8>,
     current_track_path: Option<PathBuf>,
@@ -142,6 +145,77 @@ struct WaveformCache {
     duration_str: String,
 }
 
+/// LRU cache for waveforms with a maximum size limit
+struct LruWaveformCache {
+    /// Maximum number of entries to keep
+    max_size: usize,
+    /// The actual cache data
+    cache: HashMap<u8, WaveformCache>,
+    /// Access order (most recently used at the end)
+    access_order: Vec<u8>,
+}
+
+impl LruWaveformCache {
+    /// Create a new LRU cache with the given maximum size
+    fn new(max_size: usize) -> Self {
+        Self {
+            max_size,
+            cache: HashMap::with_capacity(max_size),
+            access_order: Vec::with_capacity(max_size),
+        }
+    }
+
+    /// Get a reference to a cached waveform, updating access order
+    fn get(&mut self, track_num: &u8) -> Option<&WaveformCache> {
+        if self.cache.contains_key(track_num) {
+            // Move to end of access order (most recently used)
+            self.access_order.retain(|&k| k != *track_num);
+            self.access_order.push(*track_num);
+            self.cache.get(track_num)
+        } else {
+            None
+        }
+    }
+
+    /// Get a reference without updating access order (for read-only access)
+    fn peek(&self, track_num: &u8) -> Option<&WaveformCache> {
+        self.cache.get(track_num)
+    }
+
+    /// Insert a waveform into the cache, evicting LRU if necessary
+    fn insert(&mut self, track_num: u8, cache_entry: WaveformCache) {
+        // If already in cache, just update
+        if self.cache.contains_key(&track_num) {
+            self.cache.insert(track_num, cache_entry);
+            // Move to end of access order
+            self.access_order.retain(|&k| k != track_num);
+            self.access_order.push(track_num);
+            return;
+        }
+
+        // Evict LRU entries if at capacity
+        while self.cache.len() >= self.max_size && !self.access_order.is_empty() {
+            let lru_key = self.access_order.remove(0);
+            self.cache.remove(&lru_key);
+        }
+
+        // Insert new entry
+        self.cache.insert(track_num, cache_entry);
+        self.access_order.push(track_num);
+    }
+
+    /// Clear all cached entries
+    fn clear(&mut self) {
+        self.cache.clear();
+        self.access_order.clear();
+    }
+
+    /// Check if a track is cached
+    fn contains_key(&self, track_num: &u8) -> bool {
+        self.cache.contains_key(track_num)
+    }
+}
+
 impl AppState {
     fn new() -> Self {
         let prefs = Preferences::load();
@@ -152,7 +226,7 @@ impl AppState {
         Self {
             project: None,
             project_path: None,
-            waveform_cache: HashMap::new(),
+            waveform_cache: LruWaveformCache::new(MAX_WAVEFORM_CACHE_SIZE),
             displayed_track_num: None,
             current_track_path: None,
             current_track_num: None,
@@ -219,18 +293,22 @@ impl AppState {
         self.project.as_ref()?.album.get_track(track_num)
     }
 
-    /// Extract waveform for a track (stores full data for zooming)
-    /// Get cached waveform for a track, or None if not cached
-    fn get_cached_waveform(&self, track_num: u8) -> Option<&WaveformCache> {
-        self.waveform_cache.get(&track_num)
+    /// Check if a waveform is cached
+    fn has_cached_waveform(&self, track_num: u8) -> bool {
+        self.waveform_cache.contains_key(&track_num)
     }
 
-    /// Insert waveform into cache
+    /// Insert waveform into cache (with LRU eviction)
     fn insert_waveform(&mut self, track_num: u8, waveform_data: WaveformData, duration_str: String) {
         self.waveform_cache.insert(track_num, WaveformCache {
             waveform_data,
             duration_str,
         });
+    }
+
+    /// Access a cached waveform, updating LRU order (call when actively viewing)
+    fn access_cached_waveform(&mut self, track_num: u8) -> Option<&WaveformCache> {
+        self.waveform_cache.get(&track_num)
     }
 
     /// Get peaks for current zoom level and scroll offset for the displayed track
@@ -239,7 +317,7 @@ impl AppState {
             return Vec::new();
         };
 
-        let Some(cache) = self.waveform_cache.get(&track_num) else {
+        let Some(cache) = self.waveform_cache.peek(&track_num) else {
             return Vec::new();
         };
 
@@ -255,7 +333,7 @@ impl AppState {
 
     /// Get visible peaks for a specific track from cache
     fn get_visible_peaks_for_track(&self, track_num: u8) -> Vec<WaveformPeak> {
-        let Some(cache) = self.waveform_cache.get(&track_num) else {
+        let Some(cache) = self.waveform_cache.peek(&track_num) else {
             return Vec::new();
         };
 
@@ -684,10 +762,11 @@ fn main() -> Result<(), slint::PlatformError> {
         state.scroll_offset = 0.0;
 
         // Check if waveform is already cached
-        if state.get_cached_waveform(track_num_u8).is_some() {
-            // Cache hit - update UI immediately
+        if state.has_cached_waveform(track_num_u8) {
+            // Cache hit - update LRU order and get data
+            let _ = state.access_cached_waveform(track_num_u8); // Update LRU order
             let peaks = state.get_visible_peaks_for_track(track_num_u8);
-            let duration = state.waveform_cache.get(&track_num_u8)
+            let duration = state.waveform_cache.peek(&track_num_u8)
                 .map(|c| c.duration_str.clone())
                 .unwrap_or_default();
 
@@ -941,7 +1020,7 @@ fn main() -> Result<(), slint::PlatformError> {
         let Some(track_num) = state.displayed_track_num else {
             return;
         };
-        if state.waveform_cache.get(&track_num).is_none() {
+        if !state.has_cached_waveform(track_num) {
             return;
         }
 
@@ -975,7 +1054,7 @@ fn main() -> Result<(), slint::PlatformError> {
         let Some(track_num) = state.displayed_track_num else {
             return;
         };
-        if state.waveform_cache.get(&track_num).is_none() {
+        if !state.has_cached_waveform(track_num) {
             return;
         }
 
@@ -1009,7 +1088,7 @@ fn main() -> Result<(), slint::PlatformError> {
         let Some(track_num) = state.displayed_track_num else {
             return;
         };
-        if state.waveform_cache.get(&track_num).is_none() || state.zoom_level <= 1.0 {
+        if !state.has_cached_waveform(track_num) || state.zoom_level <= 1.0 {
             return; // No scrolling at 1x zoom
         }
 

@@ -73,7 +73,7 @@ impl WaveformData {
     }
 }
 
-/// Extract waveform peaks from a WAV file
+/// Extract waveform peaks from a WAV file using streaming (memory-efficient)
 ///
 /// # Arguments
 /// * `path` - Path to the WAV file
@@ -92,27 +92,20 @@ pub fn extract_peaks(path: &Path, target_peaks: usize) -> Result<WaveformData, W
     let total_samples = reader.duration() as u64;
     let duration_secs = total_samples as f64 / sample_rate as f64;
 
-    // Calculate samples per peak
-    let samples_per_peak = (total_samples as usize / target_peaks).max(1);
+    // Calculate frames per peak (a frame contains all channels)
+    let total_frames = total_samples as usize;
+    let frames_per_peak = (total_frames / target_peaks).max(1);
 
     let mut peaks = Vec::with_capacity(target_peaks);
 
-    // Process based on sample format
+    // Process based on sample format using streaming
     match spec.sample_format {
         hound::SampleFormat::Int => {
             let max_value = (1i32 << (bits_per_sample - 1)) as f32;
-            let samples: Vec<i32> = reader.into_samples::<i32>()
-                .filter_map(|s| s.ok())
-                .collect();
-
-            extract_peaks_from_samples(&samples, channels, samples_per_peak, max_value, &mut peaks);
+            extract_peaks_streaming_int(reader, channels, frames_per_peak, max_value, &mut peaks);
         }
         hound::SampleFormat::Float => {
-            let samples: Vec<f32> = reader.into_samples::<f32>()
-                .filter_map(|s| s.ok())
-                .collect();
-
-            extract_peaks_from_float_samples(&samples, channels, samples_per_peak, &mut peaks);
+            extract_peaks_streaming_float(reader, channels, frames_per_peak, &mut peaks);
         }
     }
 
@@ -124,70 +117,100 @@ pub fn extract_peaks(path: &Path, target_peaks: usize) -> Result<WaveformData, W
     })
 }
 
-fn extract_peaks_from_samples(
-    samples: &[i32],
+/// Streaming peak extraction for integer samples (memory-efficient)
+fn extract_peaks_streaming_int<R: std::io::Read>(
+    reader: WavReader<R>,
     channels: usize,
-    samples_per_peak: usize,
+    frames_per_peak: usize,
     max_value: f32,
     peaks: &mut Vec<(f32, f32)>,
 ) {
-    let frames = samples.len() / channels;
-    let frames_per_peak = samples_per_peak;
+    let mut min_val = 0.0f32;
+    let mut max_val = 0.0f32;
+    let mut frame_count = 0;
+    let mut channel_idx = 0;
+    let mut sample_sum: i64 = 0;
 
-    let mut frame_idx = 0;
-    while frame_idx < frames {
-        let end_frame = (frame_idx + frames_per_peak).min(frames);
+    for sample_result in reader.into_samples::<i32>() {
+        let sample = match sample_result {
+            Ok(s) => s,
+            Err(_) => continue,
+        };
 
-        let mut min_val = 0.0f32;
-        let mut max_val = 0.0f32;
+        sample_sum += sample as i64;
+        channel_idx += 1;
 
-        for f in frame_idx..end_frame {
-            // Mix all channels to mono for display
-            let mut sample_sum = 0i64;
-            for ch in 0..channels {
-                sample_sum += samples[f * channels + ch] as i64;
+        // Complete frame (all channels read)
+        if channel_idx == channels {
+            let mono_sample = (sample_sum / channels as i64) as f32 / max_value;
+            min_val = min_val.min(mono_sample);
+            max_val = max_val.max(mono_sample);
+
+            frame_count += 1;
+            channel_idx = 0;
+            sample_sum = 0;
+
+            // Complete peak bin
+            if frame_count >= frames_per_peak {
+                peaks.push((min_val, max_val));
+                min_val = 0.0;
+                max_val = 0.0;
+                frame_count = 0;
             }
-            let sample = (sample_sum / channels as i64) as f32 / max_value;
-
-            min_val = min_val.min(sample);
-            max_val = max_val.max(sample);
         }
+    }
 
+    // Push remaining frames as final peak
+    if frame_count > 0 {
         peaks.push((min_val, max_val));
-        frame_idx = end_frame;
     }
 }
 
-fn extract_peaks_from_float_samples(
-    samples: &[f32],
+/// Streaming peak extraction for float samples (memory-efficient)
+fn extract_peaks_streaming_float<R: std::io::Read>(
+    reader: WavReader<R>,
     channels: usize,
-    samples_per_peak: usize,
+    frames_per_peak: usize,
     peaks: &mut Vec<(f32, f32)>,
 ) {
-    let frames = samples.len() / channels;
-    let frames_per_peak = samples_per_peak;
+    let mut min_val = 0.0f32;
+    let mut max_val = 0.0f32;
+    let mut frame_count = 0;
+    let mut channel_idx = 0;
+    let mut sample_sum: f32 = 0.0;
 
-    let mut frame_idx = 0;
-    while frame_idx < frames {
-        let end_frame = (frame_idx + frames_per_peak).min(frames);
+    for sample_result in reader.into_samples::<f32>() {
+        let sample = match sample_result {
+            Ok(s) => s,
+            Err(_) => continue,
+        };
 
-        let mut min_val = 0.0f32;
-        let mut max_val = 0.0f32;
+        sample_sum += sample;
+        channel_idx += 1;
 
-        for f in frame_idx..end_frame {
-            // Mix all channels to mono for display
-            let mut sample_sum = 0.0f32;
-            for ch in 0..channels {
-                sample_sum += samples[f * channels + ch];
+        // Complete frame (all channels read)
+        if channel_idx == channels {
+            let mono_sample = sample_sum / channels as f32;
+            min_val = min_val.min(mono_sample);
+            max_val = max_val.max(mono_sample);
+
+            frame_count += 1;
+            channel_idx = 0;
+            sample_sum = 0.0;
+
+            // Complete peak bin
+            if frame_count >= frames_per_peak {
+                peaks.push((min_val, max_val));
+                min_val = 0.0;
+                max_val = 0.0;
+                frame_count = 0;
             }
-            let sample = sample_sum / channels as f32;
-
-            min_val = min_val.min(sample);
-            max_val = max_val.max(sample);
         }
+    }
 
+    // Push remaining frames as final peak
+    if frame_count > 0 {
         peaks.push((min_val, max_val));
-        frame_idx = end_frame;
     }
 }
 

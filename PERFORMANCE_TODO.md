@@ -6,50 +6,7 @@ Performance issues identified during code review. Items are organized by priorit
 
 ## Priority 1 - Critical (Memory/Crash Potential)
 
-### [ ] Implement streaming for waveform extraction
-**File:** `crates/redbookmaster-lib/src/audio/waveform.rs` (lines 104-116)
-
-**Issue:** The `extract_peaks` function loads the entire audio file into memory as a `Vec<i32>` or `Vec<f32>` before processing. For a 79-minute CD-quality audio file (44100 Hz x 2 channels x 16-bit x 79 min), this allocates approximately 830 MB of memory.
-
-**Current code:**
-```rust
-let samples: Vec<i32> = reader.into_samples::<i32>()
-    .filter_map(|s| s.ok())
-    .collect();
-```
-
-**Recommendation:** Use streaming/chunked processing instead of collecting all samples:
-```rust
-const CHUNK_SIZE: usize = 65536;
-let mut peaks = Vec::with_capacity(target_peaks);
-let samples_per_peak = (total_samples as usize / target_peaks).max(1);
-// Stream through samples in chunks...
-```
-
----
-
-### [ ] Implement streaming for audio conversion
-**File:** `crates/redbookmaster-lib/src/audio/convert.rs` (lines 63-89)
-
-**Issue:** The conversion pipeline:
-1. Loads entire file as `Vec<f64>`
-2. Creates a new `Vec<f64>` for channel conversion
-3. Creates another new `Vec<f64>` for resampling
-4. Creates deinterleaved channel data (more allocations)
-5. Creates reinterleaved output
-
-For a 79-minute file at f64, this can require 1.6+ GB of memory just for the initial load, with peak usage of 3-4 GB during conversion.
-
-**Recommendation:** Implement streaming conversion with fixed-size buffers.
-
----
-
-### [ ] Add LRU eviction to waveform cache
-**File:** `crates/redbookmaster-gui/src/main.rs` (lines 117-118)
-
-**Issue:** The waveform cache grows unbounded. Each cached track stores `WAVEFORM_BINS * 16 = 8000` peak pairs (approximately 128KB per track in memory). With 99 possible tracks, this could use ~12.7 MB just for peak data.
-
-**Recommendation:** Implement LRU cache with a maximum size limit (e.g., 10-20 tracks).
+_All critical items completed - see Completed section._
 
 ---
 
@@ -142,15 +99,6 @@ if let Some(row) = model.row_data(index) {
 
 ---
 
-### [ ] Pre-allocate buffers in resampler
-**File:** `crates/redbookmaster-lib/src/audio/convert.rs` (lines 256-266)
-
-**Issue:** New vectors are allocated for every chunk during resampling. For a large file processed in 1024-sample chunks, this creates thousands of allocations.
-
-**Recommendation:** Pre-allocate reusable buffers outside the loop.
-
----
-
 ### [ ] Use blocking receive in audio thread when idle
 **File:** `crates/redbookmaster-gui/src/player/engine.rs` (line 206)
 
@@ -205,7 +153,35 @@ let timeout = if state.is_playing.load(Ordering::Relaxed) {
 
 ## Completed
 
-_Move items here when done._
+### [x] Implement streaming for waveform extraction (Priority 1 - Critical)
+**File:** `crates/redbookmaster-lib/src/audio/waveform.rs`
+
+Implemented streaming peak extraction using `extract_peaks_streaming_int` and `extract_peaks_streaming_float` functions that process samples one at a time instead of loading the entire file into memory.
+
+---
+
+### [x] Implement streaming for audio conversion (Priority 1 - Critical)
+**File:** `crates/redbookmaster-lib/src/audio/convert.rs`
+
+Implemented streaming conversion with:
+- `convert_streaming_no_resample`: Memory-efficient conversion when resampling is not needed
+- `convert_with_resampling`: Chunked processing with pre-allocated buffers for resampling
+- `create_sample_iterator`: Streaming sample reader that converts to f64
+- `write_chunk_to_wav`: Writes samples in chunks with dithering
+
+This also fixed the "Pre-allocate buffers in resampler" issue (Priority 3) by pre-allocating channel buffers outside the processing loop.
+
+---
+
+### [x] Add LRU eviction to waveform cache (Priority 1 - Critical)
+**File:** `crates/redbookmaster-gui/src/main.rs`
+
+Implemented `LruWaveformCache` struct with:
+- Maximum size limit of 20 tracks
+- LRU eviction when capacity is reached
+- `peek()` for read-only access without updating order
+- `get()` for access that updates LRU order
+- `contains_key()` for existence checks
 
 ---
 
