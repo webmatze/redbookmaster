@@ -200,6 +200,11 @@ fn audio_thread(
     let mut current_path: Option<PathBuf> = None;
     let mut playback_start_time: Option<std::time::Instant> = None;
     let mut pause_offset_ms: u64 = 0;
+    let mut last_sent_position_ms: u64 = 0;
+
+    // Minimum change in position (ms) before sending a position event
+    // Reduces events from 20/sec to ~10/sec while maintaining smooth UI updates
+    const POSITION_UPDATE_THRESHOLD_MS: u64 = 100;
 
     loop {
         // Use shorter timeout when playing for responsive position updates,
@@ -397,6 +402,7 @@ fn audio_thread(
 
                 pause_offset_ms = target_ms;
                 state.position_ms.store(target_ms, Ordering::Relaxed);
+                last_sent_position_ms = target_ms; // Reset to ensure immediate UI update
 
                 // Restart if was playing
                 if was_playing {
@@ -451,13 +457,19 @@ fn audio_thread(
 
                     playback_start_time = None;
                     pause_offset_ms = 0;
+                    last_sent_position_ms = 0;
                     state.position_ms.store(0, Ordering::Relaxed);
                     state.is_playing.store(false, Ordering::Relaxed);
                     state.is_paused.store(false, Ordering::Relaxed);
                     let _ = event_tx.try_send(PlayerEvent::TrackFinished);
                 } else {
                     state.position_ms.store(current_pos, Ordering::Relaxed);
-                    let _ = event_tx.try_send(PlayerEvent::Position(current_pos));
+                    // Only send position event if position changed significantly
+                    // This reduces channel traffic while keeping atomic state accurate
+                    if current_pos.abs_diff(last_sent_position_ms) >= POSITION_UPDATE_THRESHOLD_MS {
+                        last_sent_position_ms = current_pos;
+                        let _ = event_tx.try_send(PlayerEvent::Position(current_pos));
+                    }
                 }
             }
         }

@@ -18,15 +18,6 @@ _All high priority items completed - see Completed section._
 
 ## Priority 3 - Medium (Optimization Opportunities)
 
-### [ ] Reduce position update frequency
-**File:** `crates/redbookmaster-gui/src/player/engine.rs` (lines 458-460)
-
-**Issue:** Position updates are sent every 50ms loop iteration, creating 20 events per second. Most of these may not be processed by the UI.
-
-**Recommendation:** Send position updates at a lower rate (e.g., 200ms) or only when the value changes significantly.
-
----
-
 ### [ ] Investigate SIMD for peak extraction
 **File:** `crates/redbookmaster-lib/src/audio/waveform.rs` (lines 144-154)
 
@@ -167,6 +158,18 @@ Implemented dynamic timeout based on playback state:
 - When idle/paused: 1 second timeout to reduce thread wakeups
 - Reduces idle thread wakeups from 20/second to 1/second (95% reduction)
 - Commands are still processed immediately when received
+
+---
+
+### [x] Reduce position update frequency (Priority 3 - Medium)
+**File:** `crates/redbookmaster-gui/src/player/engine.rs`
+
+Implemented threshold-based position event sending:
+- Only sends `PlayerEvent::Position` when position changes by ≥100ms
+- Atomic state is still updated every iteration for accurate seeking
+- Reduces position events from 20/sec to ~10/sec (50% reduction)
+- Reset threshold tracking on seek and track finish for immediate UI feedback
+- UI progress bar remains smooth while reducing channel traffic
 
 ---
 
