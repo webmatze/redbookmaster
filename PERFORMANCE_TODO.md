@@ -18,17 +18,6 @@ _All high priority items completed - see Completed section._
 
 ## Priority 3 - Medium (Optimization Opportunities)
 
-### [ ] Consider Path element for waveform rendering
-**File:** `crates/redbookmaster-gui/ui/main.slint` (lines 138-158)
-
-**Issue:** The waveform view creates 500 individual `Rectangle` elements (one per peak bin). Each element requires layout calculations, property binding evaluation, and rendering overhead.
-
-**Note:** The library already has a `peaks_to_svg_path()` function that could be used.
-
-**Recommendation:** Use a `Path` element with SVG path data for waveform rendering instead of 500 rectangles.
-
----
-
 ### [ ] Use blocking receive in audio thread when idle
 **File:** `crates/redbookmaster-gui/src/player/engine.rs` (line 206)
 
@@ -170,6 +159,19 @@ Implemented async file reading following the waveform worker pattern:
 - Added `adding-tracks` UI property for loading state
 - File read errors now shown via `show_error_dialog()` instead of silent stderr logging
 - UI stays responsive during file reading operations
+
+---
+
+### [x] Use Path element for waveform rendering (Priority 3 - Medium)
+**File:** `crates/redbookmaster-gui/ui/main.slint`, `crates/redbookmaster-gui/src/main.rs`
+
+Replaced 500 individual Rectangle elements with a single Path element:
+- `WaveformView` component now uses `waveform-path: string` and `has-waveform: bool` properties
+- Single Path element with SVG commands replaces HorizontalLayout with 500 Rectangles
+- Uses existing `peaks_to_svg_path()` function to generate SVG path data
+- Viewbox mapping (500x100) scales path to actual element size
+- Reduced layout calculations, property bindings, and rendering overhead
+- Removed unused `WaveformPeak` struct from Slint
 
 ---
 

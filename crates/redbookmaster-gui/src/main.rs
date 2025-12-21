@@ -10,7 +10,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
-use redbookmaster_lib::{Album, Project, Track, extract_peaks, WaveformData};
+use redbookmaster_lib::{Album, Project, Track, extract_peaks, WaveformData, peaks_to_svg_path};
 use redbookmaster_lib::core::track::format_duration_ms;
 use redbookmaster_lib::audio::concat::concatenate_tracks;
 use redbookmaster_lib::audio::convert::convert_to_red_book;
@@ -26,6 +26,10 @@ slint::include_modules!();
 
 /// Number of waveform peaks to display
 const WAVEFORM_BINS: usize = 500;
+
+/// Canonical dimensions for waveform SVG path (viewbox will scale to actual size)
+const WAVEFORM_PATH_WIDTH: f32 = 500.0;
+const WAVEFORM_PATH_HEIGHT: f32 = 100.0;
 
 /// Show an error dialog with the given title and message
 fn show_error_dialog(app: &MainWindow, title: &str, message: &str) {
@@ -396,14 +400,14 @@ impl AppState {
         self.waveform_cache.get(&track_num)
     }
 
-    /// Get peaks for current zoom level and scroll offset for the displayed track
-    fn get_visible_peaks(&self) -> Vec<WaveformPeak> {
+    /// Get SVG path for current zoom level and scroll offset for the displayed track
+    fn get_visible_path(&self, width: f32, height: f32) -> String {
         let Some(track_num) = self.displayed_track_num else {
-            return Vec::new();
+            return String::new();
         };
 
         let Some(cache) = self.waveform_cache.peek(&track_num) else {
-            return Vec::new();
+            return String::new();
         };
 
         // Calculate visible range based on zoom and scroll
@@ -411,15 +415,15 @@ impl AppState {
         let start = self.scroll_offset;
         let end = (start + view_size).min(1.0);
 
-        // Get peaks for the visible range
+        // Get peaks for the visible range and convert to SVG path
         let peaks = cache.waveform_data.get_peaks_for_range(start, end, WAVEFORM_BINS);
-        peaks.iter().map(|&(min, max)| WaveformPeak { min, max }).collect()
+        peaks_to_svg_path(&peaks, width, height, true)
     }
 
-    /// Get visible peaks for a specific track from cache
-    fn get_visible_peaks_for_track(&self, track_num: u8) -> Vec<WaveformPeak> {
+    /// Get SVG path for a specific track from cache
+    fn get_visible_path_for_track(&self, track_num: u8, width: f32, height: f32) -> String {
         let Some(cache) = self.waveform_cache.peek(&track_num) else {
-            return Vec::new();
+            return String::new();
         };
 
         // Calculate visible range based on zoom and scroll
@@ -427,9 +431,18 @@ impl AppState {
         let start = self.scroll_offset;
         let end = (start + view_size).min(1.0);
 
-        // Get peaks for the visible range
+        // Get peaks for the visible range and convert to SVG path
         let peaks = cache.waveform_data.get_peaks_for_range(start, end, WAVEFORM_BINS);
-        peaks.iter().map(|&(min, max)| WaveformPeak { min, max }).collect()
+        peaks_to_svg_path(&peaks, width, height, true)
+    }
+
+    /// Check if there's a waveform to display
+    fn has_visible_waveform(&self) -> bool {
+        if let Some(track_num) = self.displayed_track_num {
+            self.waveform_cache.contains_key(&track_num)
+        } else {
+            false
+        }
     }
 }
 
@@ -547,7 +560,8 @@ fn main() -> Result<(), slint::PlatformError> {
                 app.set_selected_track_index(-1);
                 app.set_has_project(true);
                 // Clear waveform
-                app.set_waveform_peaks(Rc::new(slint::VecModel::from(Vec::<WaveformPeak>::new())).into());
+                app.set_waveform_path("".into());
+                app.set_has_waveform(false);
                 app.set_waveform_duration("0:00".into());
             }
         }
@@ -600,7 +614,8 @@ fn main() -> Result<(), slint::PlatformError> {
                         app.set_selected_track_index(-1);
                         app.set_has_project(true);
                         // Clear waveform
-                        app.set_waveform_peaks(Rc::new(slint::VecModel::from(Vec::<WaveformPeak>::new())).into());
+                        app.set_waveform_path("".into());
+                        app.set_has_waveform(false);
                         app.set_waveform_duration("0:00".into());
                     }
                 }
@@ -840,16 +855,17 @@ fn main() -> Result<(), slint::PlatformError> {
         if state.has_cached_waveform(track_num_u8) {
             // Cache hit - update LRU order and get data
             let _ = state.access_cached_waveform(track_num_u8); // Update LRU order
-            let peaks = state.get_visible_peaks_for_track(track_num_u8);
+            let path = state.get_visible_path_for_track(track_num_u8, WAVEFORM_PATH_WIDTH, WAVEFORM_PATH_HEIGHT);
             let duration = state.waveform_cache.peek(&track_num_u8)
                 .map(|c| c.duration_str.clone())
                 .unwrap_or_default();
+            let has_waveform = !path.is_empty();
 
             drop(state); // Release borrow before UI updates
 
             if let Some(app) = app_weak.upgrade() {
-                let model = Rc::new(slint::VecModel::from(peaks));
-                app.set_waveform_peaks(model.into());
+                app.set_waveform_path(path.into());
+                app.set_has_waveform(has_waveform);
                 app.set_waveform_duration(duration.into());
                 app.set_waveform_loading(false);
                 app.set_zoom_level(1.0);
@@ -868,7 +884,8 @@ fn main() -> Result<(), slint::PlatformError> {
             app.set_status_message(format!("Loading waveform for track {}...", track_num).into());
             app.set_playhead_position(0.0);
             // Clear waveform display while loading
-            app.set_waveform_peaks(Rc::new(slint::VecModel::from(Vec::<WaveformPeak>::new())).into());
+            app.set_waveform_path("".into());
+            app.set_has_waveform(false);
         }
 
         // Get track info for background thread
@@ -1112,14 +1129,15 @@ fn main() -> Result<(), slint::PlatformError> {
         let center = state.scroll_offset + old_view_size / 2.0;
         state.scroll_offset = (center - new_view_size / 2.0).max(0.0).min(1.0 - new_view_size);
 
-        // Get updated peaks for new zoom level
-        let peaks = state.get_visible_peaks();
+        // Get updated path for new zoom level
+        let path = state.get_visible_path(WAVEFORM_PATH_WIDTH, WAVEFORM_PATH_HEIGHT);
+        let has_waveform = state.has_visible_waveform();
         let zoom_level = state.zoom_level;
         let scroll_offset = state.scroll_offset;
 
         if let Some(app) = app_weak.upgrade() {
-            let model = Rc::new(slint::VecModel::from(peaks));
-            app.set_waveform_peaks(model.into());
+            app.set_waveform_path(path.into());
+            app.set_has_waveform(has_waveform);
             app.set_zoom_level(zoom_level);
             app.set_waveform_scroll_offset(scroll_offset);
         }
@@ -1146,14 +1164,15 @@ fn main() -> Result<(), slint::PlatformError> {
         let center = state.scroll_offset + old_view_size / 2.0;
         state.scroll_offset = (center - new_view_size / 2.0).max(0.0).min(1.0 - new_view_size);
 
-        // Get updated peaks for new zoom level
-        let peaks = state.get_visible_peaks();
+        // Get updated path for new zoom level
+        let path = state.get_visible_path(WAVEFORM_PATH_WIDTH, WAVEFORM_PATH_HEIGHT);
+        let has_waveform = state.has_visible_waveform();
         let zoom_level = state.zoom_level;
         let scroll_offset = state.scroll_offset;
 
         if let Some(app) = app_weak.upgrade() {
-            let model = Rc::new(slint::VecModel::from(peaks));
-            app.set_waveform_peaks(model.into());
+            app.set_waveform_path(path.into());
+            app.set_has_waveform(has_waveform);
             app.set_zoom_level(zoom_level);
             app.set_waveform_scroll_offset(scroll_offset);
         }
@@ -1177,13 +1196,14 @@ fn main() -> Result<(), slint::PlatformError> {
         // Update scroll offset
         state.scroll_offset = (state.scroll_offset + delta * 0.1).max(0.0).min(max_scroll);
 
-        // Get updated peaks for new scroll position
-        let peaks = state.get_visible_peaks();
+        // Get updated path for new scroll position
+        let path = state.get_visible_path(WAVEFORM_PATH_WIDTH, WAVEFORM_PATH_HEIGHT);
+        let has_waveform = state.has_visible_waveform();
         let scroll_offset = state.scroll_offset;
 
         if let Some(app) = app_weak.upgrade() {
-            let model = Rc::new(slint::VecModel::from(peaks));
-            app.set_waveform_peaks(model.into());
+            app.set_waveform_path(path.into());
+            app.set_has_waveform(has_waveform);
             app.set_waveform_scroll_offset(scroll_offset);
         }
     });
@@ -1927,7 +1947,8 @@ fn main() -> Result<(), slint::PlatformError> {
                     app.set_selected_track_index(-1);
                     app.set_current_track_title("".into());
                     app.set_current_track_pregap("0".into());
-                    app.set_waveform_peaks(std::rc::Rc::new(slint::VecModel::from(Vec::<WaveformPeak>::new())).into());
+                    app.set_waveform_path("".into());
+                    app.set_has_waveform(false);
                     app.set_waveform_duration("0:00".into());
                 } else if let Some(track_num) = new_track_num {
                     // Use invoke_select_track to handle async waveform loading
@@ -2240,11 +2261,12 @@ fn main() -> Result<(), slint::PlatformError> {
 
                         // Update UI only if this is still the displayed track
                         if state.displayed_track_num == Some(track_num) {
-                            let peaks = state.get_visible_peaks();
+                            let path = state.get_visible_path(WAVEFORM_PATH_WIDTH, WAVEFORM_PATH_HEIGHT);
+                            let has_waveform = state.has_visible_waveform();
                             drop(state); // Release borrow before UI updates
 
-                            let model = Rc::new(slint::VecModel::from(peaks));
-                            app.set_waveform_peaks(model.into());
+                            app.set_waveform_path(path.into());
+                            app.set_has_waveform(has_waveform);
                             app.set_waveform_duration(duration_str.into());
                             app.set_waveform_loading(false);
                             app.set_status_message(format!("Track {} loaded", track_num).into());
