@@ -12,30 +12,6 @@ _All critical items completed - see Completed section._
 
 ## Priority 2 - High (Noticeable Performance Impact)
 
-### [ ] Batch write samples in concatenation
-**File:** `crates/redbookmaster-lib/src/audio/concat.rs` (lines 44-47, 70-73)
-
-**Issue:** Each `write_sample` call is an individual operation with potential buffering overhead.
-
-**Current code:**
-```rust
-for _ in 0..num_samples {
-    writer.write_sample(0i16).map_err(|e| ...)?;
-    writer.write_sample(0i16).map_err(|e| ...)?;
-}
-```
-
-**Recommendation:** Batch write samples using a buffer:
-```rust
-const BUFFER_SIZE: usize = 8192;
-let silence_buffer = vec![0i16; BUFFER_SIZE];
-for chunk in silence_buffer.chunks(BUFFER_SIZE) {
-    writer.write_samples(chunk)?;
-}
-```
-
----
-
 ### [ ] Update VecModel rows in-place instead of recreating
 **File:** `crates/redbookmaster-gui/src/main.rs` (multiple locations)
 
@@ -65,24 +41,6 @@ if let Some(row) = model.row_data(index) {
 **Issue:** When adding tracks, `read_wav_info()` is called synchronously for each file in the UI callback. For multiple files or large files on slow storage, this blocks the UI.
 
 **Recommendation:** Move file processing to background thread, similar to how export is handled.
-
----
-
-### [ ] Fix double file open in LoadAndPlay
-**File:** `crates/redbookmaster-gui/src/player/engine.rs` (lines 256-293)
-
-**Issue:** Files are opened twice during LoadAndPlay - once to get duration, once to decode for playback.
-
-**Recommendation:** Cache the decoded source or use rodio's `Decoder::total_duration()` without consuming the source.
-
----
-
-### [ ] Debounce auto-save
-**File:** `crates/redbookmaster-gui/src/main.rs` (lines 179-185)
-
-**Issue:** Auto-save is called after every metadata change (title edit, pregap change, etc.). Each save involves JSON serialization and file write.
-
-**Recommendation:** Debounce auto-save (e.g., save at most once per second, or on focus loss).
 
 ---
 
@@ -182,6 +140,37 @@ Implemented `LruWaveformCache` struct with:
 - `peek()` for read-only access without updating order
 - `get()` for access that updates LRU order
 - `contains_key()` for existence checks
+
+---
+
+### [x] Batch write samples in concatenation (Priority 2 - High)
+**File:** `crates/redbookmaster-lib/src/audio/concat.rs`
+
+Implemented batch processing for both silence writing and track audio writing:
+- Pre-allocates a buffer of 8192 samples
+- Reads and writes in batches instead of one sample at a time
+- Reduces overhead from individual function calls and error mapping
+
+---
+
+### [x] Fix double file open in LoadAndPlay (Priority 2 - High)
+**File:** `crates/redbookmaster-gui/src/player/engine.rs`
+
+Fixed by reusing the same decoder for both getting duration and playback:
+- `total_duration()` doesn't consume the decoder, so we can use the same source
+- Eliminated redundant file open and decode operations
+
+---
+
+### [x] Debounce auto-save (Priority 2 - High)
+**File:** `crates/redbookmaster-gui/src/main.rs`
+
+Implemented debounced auto-save with:
+- `has_pending_save` and `last_modification_time` fields in AppState
+- `auto_save()` now marks changes as pending instead of saving immediately
+- `flush_pending_save()` performs the actual save after 1 second debounce
+- Timer checks for pending saves every ~1 second
+- `force_save()` called on app exit to save any remaining changes
 
 ---
 

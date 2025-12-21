@@ -36,20 +36,30 @@ pub fn concatenate_tracks(tracks: &[Track], output: &Path) -> Result<(), ConcatE
     Ok(())
 }
 
-/// Write silence (zeroes) for the given duration
+/// Write silence (zeroes) for the given duration using batch writes
 fn write_silence(writer: &mut WavWriter<std::io::BufWriter<std::fs::File>>, duration: Duration) -> Result<(), ConcatError> {
     let num_samples = (duration.as_secs_f64() * RED_BOOK_SAMPLE_RATE as f64) as u32;
 
-    // Write stereo silence (2 channels)
-    for _ in 0..num_samples {
-        writer.write_sample(0i16).map_err(|e| ConcatError::SampleError(e.to_string()))?;
-        writer.write_sample(0i16).map_err(|e| ConcatError::SampleError(e.to_string()))?;
+    // Write stereo silence in batches for better performance
+    const BATCH_SIZE: usize = 8192;
+    let total_values = (num_samples as usize) * 2; // stereo = 2 values per sample
+    let mut remaining = total_values;
+
+    // Pre-allocate silence buffer once
+    let silence_batch: Vec<i16> = vec![0i16; BATCH_SIZE];
+
+    while remaining > 0 {
+        let batch_count = remaining.min(BATCH_SIZE);
+        for &sample in &silence_batch[..batch_count] {
+            writer.write_sample(sample).map_err(|e| ConcatError::SampleError(e.to_string()))?;
+        }
+        remaining -= batch_count;
     }
 
     Ok(())
 }
 
-/// Write audio from a track file
+/// Write audio from a track file using batch processing
 fn write_track_audio(writer: &mut WavWriter<std::io::BufWriter<std::fs::File>>, path: &Path) -> Result<(), ConcatError> {
     let mut reader = WavReader::open(path)
         .map_err(|e| ConcatError::ReadError(path.to_path_buf(), e.to_string()))?;
@@ -64,20 +74,61 @@ fn write_track_audio(writer: &mut WavWriter<std::io::BufWriter<std::fs::File>>, 
         )));
     }
 
-    // Read and write samples
+    const BATCH_SIZE: usize = 8192;
+
+    // Read and write samples in batches
     match spec.bits_per_sample {
         16 => {
-            for sample in reader.samples::<i16>() {
-                let sample = sample.map_err(|e| ConcatError::ReadError(path.to_path_buf(), e.to_string()))?;
-                writer.write_sample(sample).map_err(|e| ConcatError::SampleError(e.to_string()))?;
+            let mut buffer: Vec<i16> = Vec::with_capacity(BATCH_SIZE);
+            let mut samples_iter = reader.samples::<i16>();
+
+            loop {
+                buffer.clear();
+
+                // Fill buffer with samples
+                for _ in 0..BATCH_SIZE {
+                    match samples_iter.next() {
+                        Some(Ok(sample)) => buffer.push(sample),
+                        Some(Err(e)) => return Err(ConcatError::ReadError(path.to_path_buf(), e.to_string())),
+                        None => break,
+                    }
+                }
+
+                if buffer.is_empty() {
+                    break;
+                }
+
+                // Write batch
+                for &sample in &buffer {
+                    writer.write_sample(sample).map_err(|e| ConcatError::SampleError(e.to_string()))?;
+                }
             }
         }
         24 => {
-            // Convert 24-bit to 16-bit
-            for sample in reader.samples::<i32>() {
-                let sample = sample.map_err(|e| ConcatError::ReadError(path.to_path_buf(), e.to_string()))?;
-                let sample_16 = (sample >> 8) as i16;
-                writer.write_sample(sample_16).map_err(|e| ConcatError::SampleError(e.to_string()))?;
+            // Convert 24-bit to 16-bit with batch processing
+            let mut buffer: Vec<i16> = Vec::with_capacity(BATCH_SIZE);
+            let mut samples_iter = reader.samples::<i32>();
+
+            loop {
+                buffer.clear();
+
+                // Fill buffer with converted samples
+                for _ in 0..BATCH_SIZE {
+                    match samples_iter.next() {
+                        Some(Ok(sample)) => buffer.push((sample >> 8) as i16),
+                        Some(Err(e)) => return Err(ConcatError::ReadError(path.to_path_buf(), e.to_string())),
+                        None => break,
+                    }
+                }
+
+                if buffer.is_empty() {
+                    break;
+                }
+
+                // Write batch
+                for &sample in &buffer {
+                    writer.write_sample(sample).map_err(|e| ConcatError::SampleError(e.to_string()))?;
+                }
             }
         }
         _ => {

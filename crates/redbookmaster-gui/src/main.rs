@@ -112,6 +112,9 @@ enum PendingWarningAction {
 /// Maximum number of waveforms to cache (LRU eviction beyond this)
 const MAX_WAVEFORM_CACHE_SIZE: usize = 20;
 
+/// Minimum time between auto-saves (debounce interval)
+const AUTO_SAVE_DEBOUNCE_MS: u128 = 1000;
+
 /// Application state
 struct AppState {
     project: Option<Project>,
@@ -136,6 +139,10 @@ struct AppState {
     pending_warning_action: PendingWarningAction,
     /// Skip CD-TEXT validation (set after user confirms warning)
     skip_cd_text_validation: bool,
+    /// Whether there are unsaved changes pending
+    has_pending_save: bool,
+    /// Time of the last modification (for debouncing)
+    last_modification_time: Option<std::time::Instant>,
 }
 
 /// Cached waveform data
@@ -237,6 +244,8 @@ impl AppState {
             last_saved_window_size: last_size,
             pending_warning_action: PendingWarningAction::None,
             skip_cd_text_validation: false,
+            has_pending_save: false,
+            last_modification_time: None,
         }
     }
 
@@ -249,13 +258,42 @@ impl AppState {
         self.preferences.save();
     }
 
-    /// Auto-save the project if a path and project exist
-    fn auto_save(&self) {
+    /// Mark that a save is needed (debounced - actual save happens later)
+    fn auto_save(&mut self) {
+        self.has_pending_save = true;
+        self.last_modification_time = Some(std::time::Instant::now());
+    }
+
+    /// Perform the actual save if there are pending changes and debounce time has passed
+    fn flush_pending_save(&mut self) {
+        if !self.has_pending_save {
+            return;
+        }
+
+        // Check if enough time has passed since the last modification
+        if let Some(last_mod) = self.last_modification_time {
+            if last_mod.elapsed().as_millis() < AUTO_SAVE_DEBOUNCE_MS {
+                return; // Not enough time has passed, wait for next flush
+            }
+        }
+
+        // Perform the save
         if let (Some(path), Some(project)) = (&self.project_path, &self.project) {
             if let Err(e) = project.save_to(path) {
                 eprintln!("Auto-save failed: {}", e);
             }
         }
+        self.has_pending_save = false;
+    }
+
+    /// Force save immediately (bypasses debounce, used when closing)
+    fn force_save(&mut self) {
+        if let (Some(path), Some(project)) = (&self.project_path, &self.project) {
+            if let Err(e) = project.save_to(path) {
+                eprintln!("Auto-save failed: {}", e);
+            }
+        }
+        self.has_pending_save = false;
     }
 
     fn tracks_to_model(&self) -> Vec<TrackData> {
@@ -2397,9 +2435,17 @@ fn main() -> Result<(), slint::PlatformError> {
                 }
             }
 
-            // Periodic window size check (every ~2 seconds)
+            // Periodic checks
             let count = window_check_counter.get() + 1;
             window_check_counter.set(count);
+
+            // Flush pending auto-save (every ~1 second = 20 ticks at 50ms)
+            if count % 20 == 0 {
+                let mut state = state_for_timer.borrow_mut();
+                state.flush_pending_save();
+            }
+
+            // Window size check (every ~2 seconds = 40 ticks at 50ms)
             if count % 40 == 0 {
                 if let Some(app) = app_weak.upgrade() {
                     let size = app.window().size();
@@ -2424,5 +2470,10 @@ fn main() -> Result<(), slint::PlatformError> {
     // Keep timer alive by moving it into a variable that lives until app.run() completes
     let _timer = timer;
 
-    app.run()
+    let result = app.run();
+
+    // Force save any pending changes before exiting
+    state.borrow_mut().force_save();
+
+    result
 }

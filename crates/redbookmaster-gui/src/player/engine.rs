@@ -252,13 +252,13 @@ fn audio_thread(
                 drop(sink.take());
                 sink = create_sink(&stream_handle, *state.volume.lock());
 
-                // Load and immediately play
+                // Load and immediately play (single file open)
                 match std::fs::File::open(&path) {
                     Ok(file) => {
                         let buf_reader = std::io::BufReader::new(file);
                         match Decoder::new(buf_reader) {
                             Ok(source) => {
-                                // Get duration
+                                // Get duration (doesn't consume the source)
                                 let duration = source.total_duration()
                                     .unwrap_or(Duration::from_secs(0));
                                 let duration_ms = duration.as_millis() as u64;
@@ -272,23 +272,15 @@ fn audio_thread(
 
                                 let _ = event_tx.try_send(PlayerEvent::Loaded { duration_ms });
 
-                                // Now start playing - need to re-open file since decoder consumed it
+                                // Use the same decoder for playback
                                 if let Some(ref s) = sink {
-                                    match std::fs::File::open(&path) {
-                                        Ok(file2) => {
-                                            let buf_reader2 = std::io::BufReader::new(file2);
-                                            if let Ok(source2) = Decoder::new(buf_reader2) {
-                                                s.append(source2);
-                                                s.set_volume(*state.volume.lock());
-                                                s.play();
-                                                playback_start_time = Some(std::time::Instant::now());
-                                                state.is_playing.store(true, Ordering::Relaxed);
-                                                state.is_paused.store(false, Ordering::Relaxed);
-                                                let _ = event_tx.try_send(PlayerEvent::Playing);
-                                            }
-                                        }
-                                        Err(_) => {}
-                                    }
+                                    s.append(source);
+                                    s.set_volume(*state.volume.lock());
+                                    s.play();
+                                    playback_start_time = Some(std::time::Instant::now());
+                                    state.is_playing.store(true, Ordering::Relaxed);
+                                    state.is_paused.store(false, Ordering::Relaxed);
+                                    let _ = event_tx.try_send(PlayerEvent::Playing);
                                 }
                             }
                             Err(e) => {
