@@ -2288,6 +2288,9 @@ fn main() -> Result<(), slint::PlatformError> {
                     if let Some(app) = app_weak.upgrade() {
                         let mut state = state_for_timer.borrow_mut();
 
+                        // Clone model reference before borrowing project (avoids borrow conflict)
+                        let tracks_model = state.tracks_model.clone();
+
                         if let Some(project) = state.project.as_mut() {
                             let mut added = 0;
                             let mut needs_transcoding: Vec<(PathBuf, WavInfo)> = Vec::new();
@@ -2313,6 +2316,19 @@ fn main() -> Result<(), slint::PlatformError> {
                                                 info.duration,
                                             );
                                             project.album.add_track(track);
+
+                                            // Push to model without rebuilding (if model exists)
+                                            if let (Some(ref model), Some(track)) = (&tracks_model, project.album.tracks.last()) {
+                                                let track_data = TrackData {
+                                                    number: track.number as i32,
+                                                    title: track.title.clone().into(),
+                                                    duration: format_duration_ms(track.duration).into(),
+                                                    pregap: track.pregap.as_secs().to_string().into(),
+                                                    postgap: track.postgap.as_secs().to_string().into(),
+                                                    selected: false,
+                                                };
+                                                model.push(track_data);
+                                            }
                                             added += 1;
                                         } else {
                                             // Collect non-compliant files for transcoding dialog
@@ -2333,9 +2349,11 @@ fn main() -> Result<(), slint::PlatformError> {
                                 state.auto_save();
                             }
 
-                            // Update track list with compliant files added
-                            let model = state.initialize_tracks_model();
-                            app.set_tracks(model.into());
+                            // Only rebuild model if it doesn't exist (tracks were pushed incrementally)
+                            if state.tracks_model.is_none() {
+                                let model = state.initialize_tracks_model();
+                                app.set_tracks(model.into());
+                            }
                             app.set_album(state.album_to_model());
 
                             // Hide loading indicator
@@ -2410,6 +2428,9 @@ fn main() -> Result<(), slint::PlatformError> {
                     if let Some(app) = app_weak.upgrade() {
                         let mut state = state_for_timer.borrow_mut();
 
+                        // Clone model reference before borrowing project (avoids borrow conflict)
+                        let tracks_model = state.tracks_model.clone();
+
                         if let Some(project) = state.project.as_mut() {
                             let mut added = 0;
 
@@ -2434,14 +2455,29 @@ fn main() -> Result<(), slint::PlatformError> {
                                     duration,
                                 );
                                 project.album.add_track(track);
+
+                                // Push to model without rebuilding (if model exists)
+                                if let (Some(ref model), Some(track)) = (&tracks_model, project.album.tracks.last()) {
+                                    let track_data = TrackData {
+                                        number: track.number as i32,
+                                        title: track.title.clone().into(),
+                                        duration: format_duration_ms(track.duration).into(),
+                                        pregap: track.pregap.as_secs().to_string().into(),
+                                        postgap: track.postgap.as_secs().to_string().into(),
+                                        selected: false,
+                                    };
+                                    model.push(track_data);
+                                }
                                 added += 1;
                             }
 
                             state.auto_save();
 
-                            // Update UI with in-place model update
-                            let model = state.initialize_tracks_model();
-                            app.set_tracks(model.into());
+                            // Only rebuild model if it doesn't exist (tracks were pushed incrementally)
+                            if tracks_model.is_none() {
+                                let model = state.initialize_tracks_model();
+                                app.set_tracks(model.into());
+                            }
                             app.set_show_transcode_dialog(false);
                             app.set_is_transcoding(false);
                             app.set_status_message(format!("Converted and added {} track(s)", added).into());
