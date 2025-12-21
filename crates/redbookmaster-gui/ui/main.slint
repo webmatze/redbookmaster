@@ -268,6 +268,7 @@ export component MainWindow inherits Window {
     in property <[WaveformPeak]> waveform-peaks: [];
     in property <string> waveform-duration: "0:00";
     in property <bool> waveform-loading: false;
+    in property <bool> adding-tracks: false;
     in-out property <float> playhead-position: 0.0;
 
     // Currently edited track metadata

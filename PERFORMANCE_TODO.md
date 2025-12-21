@@ -12,35 +12,7 @@ _All critical items completed - see Completed section._
 
 ## Priority 2 - High (Noticeable Performance Impact)
 
-### [ ] Update VecModel rows in-place instead of recreating
-**File:** `crates/redbookmaster-gui/src/main.rs` (multiple locations)
-
-**Issue:** Every time tracks are updated (title change, pregap change, etc.), a completely new `VecModel` is created and set.
-
-**Current code:**
-```rust
-let tracks: Vec<TrackData> = state.tracks_to_model();
-let model = Rc::new(slint::VecModel::from(tracks));
-app.set_tracks(model.into());
-```
-
-**Recommendation:** Update existing model rows instead of recreating:
-```rust
-if let Some(row) = model.row_data(index) {
-    let mut updated = row;
-    updated.title = new_title.into();
-    model.set_row_data(index, updated);
-}
-```
-
----
-
-### [ ] Move track file reading to background thread
-**File:** `crates/redbookmaster-gui/src/main.rs` (line 521)
-
-**Issue:** When adding tracks, `read_wav_info()` is called synchronously for each file in the UI callback. For multiple files or large files on slow storage, this blocks the UI.
-
-**Recommendation:** Move file processing to background thread, similar to how export is handled.
+_All high priority items completed - see Completed section._
 
 ---
 
@@ -171,6 +143,33 @@ Implemented debounced auto-save with:
 - `flush_pending_save()` performs the actual save after 1 second debounce
 - Timer checks for pending saves every ~1 second
 - `force_save()` called on app exit to save any remaining changes
+
+---
+
+### [x] Update VecModel rows in-place instead of recreating (Priority 2 - High)
+**File:** `crates/redbookmaster-gui/src/main.rs`
+
+Implemented in-place VecModel updates:
+- Added `tracks_model: Option<Rc<VecModel<TrackData>>>` to AppState for persistent model reference
+- `initialize_tracks_model()`: Creates model and stores reference for later updates
+- `update_track_title_in_model()`: Updates title in-place using `set_row_data()`
+- `update_track_pregap_in_model()`: Updates pregap in-place using `set_row_data()`
+- `remove_and_renumber_model()`: Removes row and renumbers remaining tracks in-place
+- Track title and pregap edits now update single rows instead of rebuilding entire model
+
+---
+
+### [x] Move track file reading to background thread (Priority 2 - High)
+**File:** `crates/redbookmaster-gui/src/main.rs`, `crates/redbookmaster-gui/ui/main.slint`
+
+Implemented async file reading following the waveform worker pattern:
+- Thread-safe containers: `add_tracks_pending`, `add_tracks_result`, `add_tracks_worker_active`
+- `on_add_tracks` callback now spawns worker thread instead of reading files synchronously
+- Worker thread reads all file metadata in background using `read_wav_info()`
+- Timer polls for results and processes them on UI thread
+- Added `adding-tracks` UI property for loading state
+- File read errors now shown via `show_error_dialog()` instead of silent stderr logging
+- UI stays responsive during file reading operations
 
 ---
 

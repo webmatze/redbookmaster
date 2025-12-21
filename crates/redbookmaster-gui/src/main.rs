@@ -143,6 +143,8 @@ struct AppState {
     has_pending_save: bool,
     /// Time of the last modification (for debouncing)
     last_modification_time: Option<std::time::Instant>,
+    /// Reference to the tracks VecModel for in-place updates
+    tracks_model: Option<Rc<slint::VecModel<TrackData>>>,
 }
 
 /// Cached waveform data
@@ -246,6 +248,7 @@ impl AppState {
             skip_cd_text_validation: false,
             has_pending_save: false,
             last_modification_time: None,
+            tracks_model: None,
         }
     }
 
@@ -311,6 +314,50 @@ impl AppState {
                 selected: false,
             }
         }).collect()
+    }
+
+    /// Initialize or reset the tracks model with current project tracks
+    fn initialize_tracks_model(&mut self) -> Rc<slint::VecModel<TrackData>> {
+        let tracks = self.tracks_to_model();
+        let model = Rc::new(slint::VecModel::from(tracks));
+        self.tracks_model = Some(model.clone());
+        model
+    }
+
+    /// Update a single track's title in the model
+    fn update_track_title_in_model(&self, track_num: u8, new_title: &str) {
+        if let Some(ref model) = self.tracks_model {
+            let index = (track_num - 1) as usize;
+            if let Some(mut track_data) = model.row_data(index) {
+                track_data.title = new_title.into();
+                model.set_row_data(index, track_data);
+            }
+        }
+    }
+
+    /// Update a single track's pregap in the model
+    fn update_track_pregap_in_model(&self, track_num: u8, pregap_secs: u64) {
+        if let Some(ref model) = self.tracks_model {
+            let index = (track_num - 1) as usize;
+            if let Some(mut track_data) = model.row_data(index) {
+                track_data.pregap = pregap_secs.to_string().into();
+                model.set_row_data(index, track_data);
+            }
+        }
+    }
+
+    /// Remove a track from the model and renumber remaining
+    fn remove_and_renumber_model(&self, index: usize) {
+        if let Some(ref model) = self.tracks_model {
+            model.remove(index);
+            // Renumber remaining tracks
+            for i in index..model.row_count() {
+                if let Some(mut track_data) = model.row_data(i) {
+                    track_data.number = (i + 1) as i32;
+                    model.set_row_data(i, track_data);
+                }
+            }
+        }
     }
 
     fn album_to_model(&self) -> AlbumData {
@@ -493,8 +540,7 @@ fn main() -> Result<(), slint::PlatformError> {
             state.save_preferences();
 
             if let Some(app) = app_weak.upgrade() {
-                let tracks: Vec<TrackData> = state.tracks_to_model();
-                let model = Rc::new(slint::VecModel::from(tracks));
+                let model = state.initialize_tracks_model();
                 app.set_tracks(model.into());
                 app.set_album(state.album_to_model());
                 app.set_status_message(format!("Created project: {}", project_dir.display()).into());
@@ -547,8 +593,7 @@ fn main() -> Result<(), slint::PlatformError> {
                     state.save_preferences();
 
                     if let Some(app) = app_weak.upgrade() {
-                        let tracks: Vec<TrackData> = state.tracks_to_model();
-                        let model = Rc::new(slint::VecModel::from(tracks));
+                        let model = state.initialize_tracks_model();
                         app.set_tracks(model.into());
                         app.set_album(state.album_to_model());
                         app.set_status_message(format!("Opened: {}", path.display()).into());
@@ -606,8 +651,22 @@ fn main() -> Result<(), slint::PlatformError> {
         }
     });
 
+    // Shared containers for async file reading when adding tracks (thread-safe)
+    // Stores the pending request: list of file paths to read
+    let add_tracks_pending: Arc<std::sync::Mutex<Option<Vec<PathBuf>>>> =
+        Arc::new(std::sync::Mutex::new(None));
+    // Stores the results: list of (path, WavInfo) or (path, error_message)
+    type AddTracksResult = Vec<Result<(PathBuf, WavInfo), (PathBuf, String)>>;
+    let add_tracks_result: Arc<std::sync::Mutex<Option<AddTracksResult>>> =
+        Arc::new(std::sync::Mutex::new(None));
+    // Flag indicating if a file reading worker thread is currently running
+    let add_tracks_worker_active: Arc<AtomicBool> = Arc::new(AtomicBool::new(false));
+
     let app_weak = app.as_weak();
     let state_clone = state.clone();
+    let at_pending = add_tracks_pending.clone();
+    let at_result = add_tracks_result.clone();
+    let at_worker_active = add_tracks_worker_active.clone();
     app.on_add_tracks(move || {
         // First check if we have a project
         {
@@ -625,99 +684,77 @@ fn main() -> Result<(), slint::PlatformError> {
             .set_title("Select WAV files to add");
 
         if let Some(files) = dialog.pick_files() {
-            let mut state = state_clone.borrow_mut();
+            if files.is_empty() {
+                return;
+            }
 
-            let Some(project) = state.project.as_mut() else {
-                return; // Project was closed while dialog was open
-            };
-            let mut added = 0;
-            let mut needs_transcoding: Vec<(PathBuf, WavInfo)> = Vec::new();
+            // Check project still exists
+            {
+                let state = state_clone.borrow();
+                if state.project.is_none() {
+                    return;
+                }
+            }
 
-            for path in files {
-                match read_wav_info(&path) {
-                    Ok(info) => {
-                        if info.is_red_book_compliant() {
-                            // Get title from filename
-                            let title = path.file_stem()
-                                .and_then(|s| s.to_str())
-                                .unwrap_or("Unknown")
-                                .to_string();
+            let file_count = files.len();
 
-                            let track_num = project.album.track_count() + 1;
+            // Show loading status
+            if let Some(app) = app_weak.upgrade() {
+                app.set_adding_tracks(true);
+                app.set_status_message(format!("Reading {} file(s)...", file_count).into());
+            }
 
-                            // Create track with ABSOLUTE path (no copying)
-                            let track = Track::new(
-                                track_num as u8,
-                                title,
-                                path.clone(),  // Store original absolute path
-                                info.duration,
-                            );
-                            project.album.add_track(track);
-                            added += 1;
-                        } else {
-                            // Collect non-compliant files for transcoding dialog
-                            needs_transcoding.push((path, info));
+            // Store pending request
+            if let Ok(mut pending) = at_pending.lock() {
+                *pending = Some(files);
+            }
+
+            // Spawn worker thread if not already running
+            if !at_worker_active.swap(true, Ordering::SeqCst) {
+                let pending_clone = at_pending.clone();
+                let result_clone = at_result.clone();
+                let worker_active_clone = at_worker_active.clone();
+
+                std::thread::spawn(move || {
+                    loop {
+                        // Get the pending request (take it, leaving None)
+                        let request = {
+                            let mut pending = pending_clone.lock().expect("mutex poisoned");
+                            pending.take()
+                        };
+
+                        let Some(paths) = request else {
+                            break; // No more requests
+                        };
+
+                        // Read all files (the slow part - done in background)
+                        let results: Vec<Result<(PathBuf, WavInfo), (PathBuf, String)>> = paths
+                            .into_iter()
+                            .map(|path| {
+                                match read_wav_info(&path) {
+                                    Ok(info) => Ok((path, info)),
+                                    Err(e) => Err((path, e.to_string())),
+                                }
+                            })
+                            .collect();
+
+                        // Store results for UI thread to pick up
+                        if let Ok(mut result) = result_clone.lock() {
+                            *result = Some(results);
+                        }
+
+                        // Check for more pending requests
+                        let has_pending = {
+                            let pending = pending_clone.lock().expect("mutex poisoned");
+                            pending.is_some()
+                        };
+
+                        if !has_pending {
+                            break;
                         }
                     }
-                    Err(e) => {
-                        eprintln!("Failed to read WAV: {}", e);
-                    }
-                }
-            }
-
-            // Auto-save project after adding tracks
-            if added > 0 {
-                state.auto_save();
-            }
-
-            if let Some(app) = app_weak.upgrade() {
-                // Update track list with compliant files added so far
-                let tracks: Vec<TrackData> = state.tracks_to_model();
-                let model = Rc::new(slint::VecModel::from(tracks));
-                app.set_tracks(model.into());
-                app.set_album(state.album_to_model());
-
-                if !needs_transcoding.is_empty() {
-                    // Build transcode file info for dialog
-                    let transcode_infos: Vec<TranscodeFileInfo> = needs_transcoding.iter()
-                        .map(|(path, info)| {
-                            let filename = path.file_name()
-                                .and_then(|s| s.to_str())
-                                .unwrap_or("Unknown")
-                                .to_string();
-
-                            // Format issues in a user-friendly way
-                            let issues = info.format_issues().join(", ")
-                                .replace("Hz (needs 44100Hz)", "Hz → 44100Hz")
-                                .replace("bits (needs 16 bits)", "-bit → 16-bit")
-                                .replace("(needs stereo)", "→ Stereo");
-
-                            TranscodeFileInfo {
-                                filename: filename.into(),
-                                issues: issues.into(),
-                                path: path.to_string_lossy().to_string().into(),
-                            }
-                        })
-                        .collect();
-
-                    // Store pending files and show dialog
-                    state.pending_transcode_files = needs_transcoding;
-
-                    let model = Rc::new(slint::VecModel::from(transcode_infos));
-                    app.set_transcode_files(model.into());
-                    app.set_show_transcode_dialog(true);
-                    app.set_is_transcoding(false);
-                    app.set_transcode_progress(0.0);
-                    app.set_transcode_status("".into());
-
-                    app.set_status_message(format!(
-                        "Added {} track(s), {} need conversion",
-                        added,
-                        state.pending_transcode_files.len()
-                    ).into());
-                } else {
-                    app.set_status_message(format!("Added {} track(s)", added).into());
-                }
+                    worker_active_clone.store(false, Ordering::SeqCst);
+                });
             }
         }
     });
@@ -923,20 +960,23 @@ fn main() -> Result<(), slint::PlatformError> {
     });
 
     let state_clone = state.clone();
-    let app_weak = app.as_weak();
     app.on_update_track_title(move |track_num, title| {
         let mut state = state_clone.borrow_mut();
-        if let Some(ref mut project) = state.project {
-            if let Some(track) = project.album.get_track_mut(track_num as u8) {
-                track.title = title.to_string();
-                if let Some(app) = app_weak.upgrade() {
-                    let tracks: Vec<TrackData> = state.tracks_to_model();
-                    let model = Rc::new(slint::VecModel::from(tracks));
-                    app.set_tracks(model.into());
+        // Update the track in the project (scoped to release borrow)
+        {
+            if let Some(ref mut project) = state.project {
+                if let Some(track) = project.album.get_track_mut(track_num as u8) {
+                    track.title = title.to_string();
+                } else {
+                    return;
                 }
-                state.auto_save();
+            } else {
+                return;
             }
         }
+        // Update the model in-place (project borrow released)
+        state.update_track_title_in_model(track_num as u8, &title);
+        state.auto_save();
     });
 
     // Playback callbacks
@@ -1825,7 +1865,8 @@ fn main() -> Result<(), slint::PlatformError> {
     let state_clone = state.clone();
     let app_weak = app.as_weak();
     app.on_remove_track(move |track_num| {
-        let removed = {
+        // First: remove from project and get the removed index
+        let removed_idx = {
             let mut state = state_clone.borrow_mut();
             if let Some(ref mut project) = state.project {
                 // Find track index by number
@@ -1840,20 +1881,25 @@ fn main() -> Result<(), slint::PlatformError> {
                     state.displayed_track_num = None;
 
                     state.auto_save();
-                    true
+                    Some(idx)
                 } else {
-                    false
+                    None
                 }
             } else {
-                false
+                None
             }
         };
 
-        if removed {
-            // Gather all UI update data while holding the borrow
-            let (tracks, new_count, new_track_num) = {
+        if let Some(idx) = removed_idx {
+            // Update the model in-place
+            {
                 let state = state_clone.borrow();
-                let tracks = state.tracks_to_model();
+                state.remove_and_renumber_model(idx);
+            }
+
+            // Gather remaining UI update data
+            let (new_count, new_track_num) = {
+                let state = state_clone.borrow();
                 let new_count = state.project.as_ref().map(|p| p.album.tracks.len()).unwrap_or(0) as i32;
 
                 // Get track number for the new selection
@@ -1872,14 +1918,11 @@ fn main() -> Result<(), slint::PlatformError> {
                     None
                 };
 
-                (tracks, new_count, new_track_num)
+                (new_count, new_track_num)
             };
 
             // Now update UI without holding borrows
             if let Some(app) = app_weak.upgrade() {
-                let model = std::rc::Rc::new(slint::VecModel::from(tracks));
-                app.set_tracks(model.into());
-
                 if new_count == 0 {
                     app.set_selected_track_index(-1);
                     app.set_current_track_title("".into());
@@ -1896,22 +1939,27 @@ fn main() -> Result<(), slint::PlatformError> {
     });
 
     let state_clone = state.clone();
-    let app_weak = app.as_weak();
     app.on_update_track_pregap(move |track_num, pregap| {
         let mut state = state_clone.borrow_mut();
-        if let Some(ref mut project) = state.project {
-            if let Ok(secs) = pregap.parse::<u64>() {
+        let secs = match pregap.parse::<u64>() {
+            Ok(s) => s,
+            Err(_) => return,
+        };
+        // Update the track in the project (scoped to release borrow)
+        {
+            if let Some(ref mut project) = state.project {
                 if let Some(track) = project.album.get_track_mut(track_num as u8) {
                     track.pregap = std::time::Duration::from_secs(secs);
-                    if let Some(app) = app_weak.upgrade() {
-                        let tracks: Vec<TrackData> = state.tracks_to_model();
-                        let model = Rc::new(slint::VecModel::from(tracks));
-                        app.set_tracks(model.into());
-                    }
-                    state.auto_save();
+                } else {
+                    return;
                 }
+            } else {
+                return;
             }
         }
+        // Update the model in-place (project borrow released)
+        state.update_track_pregap_in_model(track_num as u8, secs);
+        state.auto_save();
     });
 
     // Track reordering via drag-and-drop
@@ -1922,7 +1970,7 @@ fn main() -> Result<(), slint::PlatformError> {
         let to_idx = to_index as usize;
 
         // Reorder tracks and get data for UI update
-        let (tracks, track_num) = {
+        let (model, track_num) = {
             let mut state = state_clone.borrow_mut();
             let Some(ref mut project) = state.project else {
                 return;
@@ -1956,21 +2004,19 @@ fn main() -> Result<(), slint::PlatformError> {
             // Get track number for the moved track (now at insert_idx)
             let track_num = project.album.tracks.get(insert_idx).map(|t| t.number as i32);
 
-            // Prepare UI data
-            let tracks = state.tracks_to_model();
-
             // Invalidate waveform cache since track numbers changed
             state.waveform_cache.clear();
             state.displayed_track_num = None;
 
             state.auto_save();
 
-            (tracks, track_num)
+            // Full rebuild for reorder (complex renumbering)
+            let model = state.initialize_tracks_model();
+            (model, track_num)
         };
 
         // Update UI
         if let Some(app) = app_weak.upgrade() {
-            let model = Rc::new(slint::VecModel::from(tracks));
             app.set_tracks(model.into());
 
             // Use invoke_select_track to handle async waveform loading
@@ -2169,6 +2215,8 @@ fn main() -> Result<(), slint::PlatformError> {
     let completed_for_timer = completed_conversions.clone();
     let done_for_timer = conversion_done.clone();
     let waveform_result_for_timer = waveform_result.clone();
+    // Add tracks async state for timer polling
+    let add_tracks_result_for_timer = add_tracks_result.clone();
     // Burn state for timer polling
     let burn_log_timer = burn_log.clone();
     let burn_complete_timer = burn_complete.clone();
@@ -2200,6 +2248,121 @@ fn main() -> Result<(), slint::PlatformError> {
                             app.set_waveform_duration(duration_str.into());
                             app.set_waveform_loading(false);
                             app.set_status_message(format!("Track {} loaded", track_num).into());
+                        }
+                    }
+                }
+            }
+
+            // Check for completed file reading (add tracks async)
+            if let Ok(mut result) = add_tracks_result_for_timer.try_lock() {
+                if let Some(results) = result.take() {
+                    if let Some(app) = app_weak.upgrade() {
+                        let mut state = state_for_timer.borrow_mut();
+
+                        if let Some(project) = state.project.as_mut() {
+                            let mut added = 0;
+                            let mut needs_transcoding: Vec<(PathBuf, WavInfo)> = Vec::new();
+                            let mut errors: Vec<String> = Vec::new();
+
+                            for file_result in results {
+                                match file_result {
+                                    Ok((path, info)) => {
+                                        if info.is_red_book_compliant() {
+                                            // Get title from filename
+                                            let title = path.file_stem()
+                                                .and_then(|s| s.to_str())
+                                                .unwrap_or("Unknown")
+                                                .to_string();
+
+                                            let track_num = project.album.track_count() + 1;
+
+                                            // Create track with ABSOLUTE path (no copying)
+                                            let track = Track::new(
+                                                track_num as u8,
+                                                title,
+                                                path.clone(),
+                                                info.duration,
+                                            );
+                                            project.album.add_track(track);
+                                            added += 1;
+                                        } else {
+                                            // Collect non-compliant files for transcoding dialog
+                                            needs_transcoding.push((path, info));
+                                        }
+                                    }
+                                    Err((path, error)) => {
+                                        let filename = path.file_name()
+                                            .and_then(|n| n.to_str())
+                                            .unwrap_or("Unknown");
+                                        errors.push(format!("{}: {}", filename, error));
+                                    }
+                                }
+                            }
+
+                            // Auto-save project after adding tracks
+                            if added > 0 {
+                                state.auto_save();
+                            }
+
+                            // Update track list with compliant files added
+                            let model = state.initialize_tracks_model();
+                            app.set_tracks(model.into());
+                            app.set_album(state.album_to_model());
+
+                            // Hide loading indicator
+                            app.set_adding_tracks(false);
+
+                            // Show errors if any
+                            if !errors.is_empty() {
+                                show_error_dialog(&app, "File Read Errors",
+                                    &format!("Some files could not be read:\n\n{}", errors.join("\n")));
+                            }
+
+                            if !needs_transcoding.is_empty() {
+                                // Build transcode file info for dialog
+                                let transcode_infos: Vec<TranscodeFileInfo> = needs_transcoding.iter()
+                                    .map(|(path, info)| {
+                                        let filename = path.file_name()
+                                            .and_then(|s| s.to_str())
+                                            .unwrap_or("Unknown")
+                                            .to_string();
+
+                                        // Format issues in a user-friendly way
+                                        let issues = info.format_issues().join(", ")
+                                            .replace("Hz (needs 44100Hz)", "Hz → 44100Hz")
+                                            .replace("bits (needs 16 bits)", "-bit → 16-bit")
+                                            .replace("(needs stereo)", "→ Stereo");
+
+                                        TranscodeFileInfo {
+                                            filename: filename.into(),
+                                            issues: issues.into(),
+                                            path: path.to_string_lossy().to_string().into(),
+                                        }
+                                    })
+                                    .collect();
+
+                                // Store pending files and show dialog
+                                state.pending_transcode_files = needs_transcoding;
+
+                                let model = Rc::new(slint::VecModel::from(transcode_infos));
+                                app.set_transcode_files(model.into());
+                                app.set_show_transcode_dialog(true);
+                                app.set_is_transcoding(false);
+                                app.set_transcode_progress(0.0);
+                                app.set_transcode_status("".into());
+
+                                app.set_status_message(format!(
+                                    "Added {} track(s), {} need conversion",
+                                    added,
+                                    state.pending_transcode_files.len()
+                                ).into());
+                            } else {
+                                app.set_status_message(format!("Added {} track(s)", added).into());
+                            }
+                        } else {
+                            // Project was closed while reading files
+                            app.set_adding_tracks(false);
+                            app.set_status_message("Project closed".into());
                         }
                     }
                 }
@@ -2247,9 +2410,8 @@ fn main() -> Result<(), slint::PlatformError> {
 
                             state.auto_save();
 
-                            // Update UI
-                            let tracks: Vec<TrackData> = state.tracks_to_model();
-                            let model = Rc::new(slint::VecModel::from(tracks));
+                            // Update UI with in-place model update
+                            let model = state.initialize_tracks_model();
                             app.set_tracks(model.into());
                             app.set_show_transcode_dialog(false);
                             app.set_is_transcoding(false);
