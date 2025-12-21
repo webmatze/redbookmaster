@@ -200,10 +200,23 @@ fn audio_thread(
     let mut current_path: Option<PathBuf> = None;
     let mut playback_start_time: Option<std::time::Instant> = None;
     let mut pause_offset_ms: u64 = 0;
+    let mut last_sent_position_ms: u64 = 0;
+
+    // Minimum change in position (ms) before sending a position event
+    // Reduces events from 20/sec to ~10/sec while maintaining smooth UI updates
+    const POSITION_UPDATE_THRESHOLD_MS: u64 = 100;
 
     loop {
+        // Use shorter timeout when playing for responsive position updates,
+        // longer timeout when idle to reduce thread wakeups
+        let timeout = if state.is_playing.load(Ordering::Relaxed) && !state.is_paused.load(Ordering::Relaxed) {
+            Duration::from_millis(50)
+        } else {
+            Duration::from_secs(1)
+        };
+
         // Process commands (non-blocking with timeout)
-        match command_rx.recv_timeout(Duration::from_millis(50)) {
+        match command_rx.recv_timeout(timeout) {
             Ok(PlayerCommand::Load(path)) => {
                 // Stop current playback by dropping old sink and creating new one
                 drop(sink.take());
@@ -252,13 +265,13 @@ fn audio_thread(
                 drop(sink.take());
                 sink = create_sink(&stream_handle, *state.volume.lock());
 
-                // Load and immediately play
+                // Load and immediately play (single file open)
                 match std::fs::File::open(&path) {
                     Ok(file) => {
                         let buf_reader = std::io::BufReader::new(file);
                         match Decoder::new(buf_reader) {
                             Ok(source) => {
-                                // Get duration
+                                // Get duration (doesn't consume the source)
                                 let duration = source.total_duration()
                                     .unwrap_or(Duration::from_secs(0));
                                 let duration_ms = duration.as_millis() as u64;
@@ -272,23 +285,15 @@ fn audio_thread(
 
                                 let _ = event_tx.try_send(PlayerEvent::Loaded { duration_ms });
 
-                                // Now start playing - need to re-open file since decoder consumed it
+                                // Use the same decoder for playback
                                 if let Some(ref s) = sink {
-                                    match std::fs::File::open(&path) {
-                                        Ok(file2) => {
-                                            let buf_reader2 = std::io::BufReader::new(file2);
-                                            if let Ok(source2) = Decoder::new(buf_reader2) {
-                                                s.append(source2);
-                                                s.set_volume(*state.volume.lock());
-                                                s.play();
-                                                playback_start_time = Some(std::time::Instant::now());
-                                                state.is_playing.store(true, Ordering::Relaxed);
-                                                state.is_paused.store(false, Ordering::Relaxed);
-                                                let _ = event_tx.try_send(PlayerEvent::Playing);
-                                            }
-                                        }
-                                        Err(_) => {}
-                                    }
+                                    s.append(source);
+                                    s.set_volume(*state.volume.lock());
+                                    s.play();
+                                    playback_start_time = Some(std::time::Instant::now());
+                                    state.is_playing.store(true, Ordering::Relaxed);
+                                    state.is_paused.store(false, Ordering::Relaxed);
+                                    let _ = event_tx.try_send(PlayerEvent::Playing);
                                 }
                             }
                             Err(e) => {
@@ -397,6 +402,7 @@ fn audio_thread(
 
                 pause_offset_ms = target_ms;
                 state.position_ms.store(target_ms, Ordering::Relaxed);
+                last_sent_position_ms = target_ms; // Reset to ensure immediate UI update
 
                 // Restart if was playing
                 if was_playing {
@@ -451,13 +457,19 @@ fn audio_thread(
 
                     playback_start_time = None;
                     pause_offset_ms = 0;
+                    last_sent_position_ms = 0;
                     state.position_ms.store(0, Ordering::Relaxed);
                     state.is_playing.store(false, Ordering::Relaxed);
                     state.is_paused.store(false, Ordering::Relaxed);
                     let _ = event_tx.try_send(PlayerEvent::TrackFinished);
                 } else {
                     state.position_ms.store(current_pos, Ordering::Relaxed);
-                    let _ = event_tx.try_send(PlayerEvent::Position(current_pos));
+                    // Only send position event if position changed significantly
+                    // This reduces channel traffic while keeping atomic state accurate
+                    if current_pos.abs_diff(last_sent_position_ms) >= POSITION_UPDATE_THRESHOLD_MS {
+                        last_sent_position_ms = current_pos;
+                        let _ = event_tx.try_send(PlayerEvent::Position(current_pos));
+                    }
                 }
             }
         }

@@ -10,7 +10,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
-use redbookmaster_lib::{Album, Project, Track, extract_peaks, WaveformData};
+use redbookmaster_lib::{Album, Project, Track, extract_peaks, WaveformData, peaks_to_svg_path};
 use redbookmaster_lib::core::track::format_duration_ms;
 use redbookmaster_lib::audio::concat::concatenate_tracks;
 use redbookmaster_lib::audio::convert::convert_to_red_book;
@@ -26,6 +26,10 @@ slint::include_modules!();
 
 /// Number of waveform peaks to display
 const WAVEFORM_BINS: usize = 500;
+
+/// Canonical dimensions for waveform SVG path (viewbox will scale to actual size)
+const WAVEFORM_PATH_WIDTH: f32 = 500.0;
+const WAVEFORM_PATH_HEIGHT: f32 = 100.0;
 
 /// Show an error dialog with the given title and message
 fn show_error_dialog(app: &MainWindow, title: &str, message: &str) {
@@ -109,12 +113,18 @@ enum PendingWarningAction {
     Burn,
 }
 
+/// Maximum number of waveforms to cache (LRU eviction beyond this)
+const MAX_WAVEFORM_CACHE_SIZE: usize = 20;
+
+/// Minimum time between auto-saves (debounce interval)
+const AUTO_SAVE_DEBOUNCE_MS: u128 = 1000;
+
 /// Application state
 struct AppState {
     project: Option<Project>,
     project_path: Option<PathBuf>,
-    /// Multi-track waveform cache (track_number -> cache)
-    waveform_cache: HashMap<u8, WaveformCache>,
+    /// Multi-track waveform cache with LRU eviction
+    waveform_cache: LruWaveformCache,
     /// Currently displayed track number
     displayed_track_num: Option<u8>,
     current_track_path: Option<PathBuf>,
@@ -133,6 +143,14 @@ struct AppState {
     pending_warning_action: PendingWarningAction,
     /// Skip CD-TEXT validation (set after user confirms warning)
     skip_cd_text_validation: bool,
+    /// Whether there are unsaved changes pending
+    has_pending_save: bool,
+    /// Time of the last modification (for debouncing)
+    last_modification_time: Option<std::time::Instant>,
+    /// Reference to the tracks VecModel for in-place updates
+    tracks_model: Option<Rc<slint::VecModel<TrackData>>>,
+    /// Reusable buffer for peak data to avoid allocation on zoom/scroll
+    peaks_buffer: Vec<(f32, f32)>,
 }
 
 /// Cached waveform data
@@ -140,6 +158,77 @@ struct WaveformCache {
     /// Full waveform data for zooming
     waveform_data: WaveformData,
     duration_str: String,
+}
+
+/// LRU cache for waveforms with a maximum size limit
+struct LruWaveformCache {
+    /// Maximum number of entries to keep
+    max_size: usize,
+    /// The actual cache data
+    cache: HashMap<u8, WaveformCache>,
+    /// Access order (most recently used at the end)
+    access_order: Vec<u8>,
+}
+
+impl LruWaveformCache {
+    /// Create a new LRU cache with the given maximum size
+    fn new(max_size: usize) -> Self {
+        Self {
+            max_size,
+            cache: HashMap::with_capacity(max_size),
+            access_order: Vec::with_capacity(max_size),
+        }
+    }
+
+    /// Get a reference to a cached waveform, updating access order
+    fn get(&mut self, track_num: &u8) -> Option<&WaveformCache> {
+        if self.cache.contains_key(track_num) {
+            // Move to end of access order (most recently used)
+            self.access_order.retain(|&k| k != *track_num);
+            self.access_order.push(*track_num);
+            self.cache.get(track_num)
+        } else {
+            None
+        }
+    }
+
+    /// Get a reference without updating access order (for read-only access)
+    fn peek(&self, track_num: &u8) -> Option<&WaveformCache> {
+        self.cache.get(track_num)
+    }
+
+    /// Insert a waveform into the cache, evicting LRU if necessary
+    fn insert(&mut self, track_num: u8, cache_entry: WaveformCache) {
+        // If already in cache, just update
+        if self.cache.contains_key(&track_num) {
+            self.cache.insert(track_num, cache_entry);
+            // Move to end of access order
+            self.access_order.retain(|&k| k != track_num);
+            self.access_order.push(track_num);
+            return;
+        }
+
+        // Evict LRU entries if at capacity
+        while self.cache.len() >= self.max_size && !self.access_order.is_empty() {
+            let lru_key = self.access_order.remove(0);
+            self.cache.remove(&lru_key);
+        }
+
+        // Insert new entry
+        self.cache.insert(track_num, cache_entry);
+        self.access_order.push(track_num);
+    }
+
+    /// Clear all cached entries
+    fn clear(&mut self) {
+        self.cache.clear();
+        self.access_order.clear();
+    }
+
+    /// Check if a track is cached
+    fn contains_key(&self, track_num: &u8) -> bool {
+        self.cache.contains_key(track_num)
+    }
 }
 
 impl AppState {
@@ -152,7 +241,7 @@ impl AppState {
         Self {
             project: None,
             project_path: None,
-            waveform_cache: HashMap::new(),
+            waveform_cache: LruWaveformCache::new(MAX_WAVEFORM_CACHE_SIZE),
             displayed_track_num: None,
             current_track_path: None,
             current_track_num: None,
@@ -163,6 +252,10 @@ impl AppState {
             last_saved_window_size: last_size,
             pending_warning_action: PendingWarningAction::None,
             skip_cd_text_validation: false,
+            has_pending_save: false,
+            last_modification_time: None,
+            tracks_model: None,
+            peaks_buffer: Vec::with_capacity(WAVEFORM_BINS),
         }
     }
 
@@ -175,13 +268,42 @@ impl AppState {
         self.preferences.save();
     }
 
-    /// Auto-save the project if a path and project exist
-    fn auto_save(&self) {
+    /// Mark that a save is needed (debounced - actual save happens later)
+    fn auto_save(&mut self) {
+        self.has_pending_save = true;
+        self.last_modification_time = Some(std::time::Instant::now());
+    }
+
+    /// Perform the actual save if there are pending changes and debounce time has passed
+    fn flush_pending_save(&mut self) {
+        if !self.has_pending_save {
+            return;
+        }
+
+        // Check if enough time has passed since the last modification
+        if let Some(last_mod) = self.last_modification_time {
+            if last_mod.elapsed().as_millis() < AUTO_SAVE_DEBOUNCE_MS {
+                return; // Not enough time has passed, wait for next flush
+            }
+        }
+
+        // Perform the save
         if let (Some(path), Some(project)) = (&self.project_path, &self.project) {
             if let Err(e) = project.save_to(path) {
                 eprintln!("Auto-save failed: {}", e);
             }
         }
+        self.has_pending_save = false;
+    }
+
+    /// Force save immediately (bypasses debounce, used when closing)
+    fn force_save(&mut self) {
+        if let (Some(path), Some(project)) = (&self.project_path, &self.project) {
+            if let Err(e) = project.save_to(path) {
+                eprintln!("Auto-save failed: {}", e);
+            }
+        }
+        self.has_pending_save = false;
     }
 
     fn tracks_to_model(&self) -> Vec<TrackData> {
@@ -199,6 +321,50 @@ impl AppState {
                 selected: false,
             }
         }).collect()
+    }
+
+    /// Initialize or reset the tracks model with current project tracks
+    fn initialize_tracks_model(&mut self) -> Rc<slint::VecModel<TrackData>> {
+        let tracks = self.tracks_to_model();
+        let model = Rc::new(slint::VecModel::from(tracks));
+        self.tracks_model = Some(model.clone());
+        model
+    }
+
+    /// Update a single track's title in the model
+    fn update_track_title_in_model(&self, track_num: u8, new_title: &str) {
+        if let Some(ref model) = self.tracks_model {
+            let index = (track_num - 1) as usize;
+            if let Some(mut track_data) = model.row_data(index) {
+                track_data.title = new_title.into();
+                model.set_row_data(index, track_data);
+            }
+        }
+    }
+
+    /// Update a single track's pregap in the model
+    fn update_track_pregap_in_model(&self, track_num: u8, pregap_secs: u64) {
+        if let Some(ref model) = self.tracks_model {
+            let index = (track_num - 1) as usize;
+            if let Some(mut track_data) = model.row_data(index) {
+                track_data.pregap = pregap_secs.to_string().into();
+                model.set_row_data(index, track_data);
+            }
+        }
+    }
+
+    /// Remove a track from the model and renumber remaining
+    fn remove_and_renumber_model(&self, index: usize) {
+        if let Some(ref model) = self.tracks_model {
+            model.remove(index);
+            // Renumber remaining tracks
+            for i in index..model.row_count() {
+                if let Some(mut track_data) = model.row_data(i) {
+                    track_data.number = (i + 1) as i32;
+                    model.set_row_data(i, track_data);
+                }
+            }
+        }
     }
 
     fn album_to_model(&self) -> AlbumData {
@@ -219,13 +385,12 @@ impl AppState {
         self.project.as_ref()?.album.get_track(track_num)
     }
 
-    /// Extract waveform for a track (stores full data for zooming)
-    /// Get cached waveform for a track, or None if not cached
-    fn get_cached_waveform(&self, track_num: u8) -> Option<&WaveformCache> {
-        self.waveform_cache.get(&track_num)
+    /// Check if a waveform is cached
+    fn has_cached_waveform(&self, track_num: u8) -> bool {
+        self.waveform_cache.contains_key(&track_num)
     }
 
-    /// Insert waveform into cache
+    /// Insert waveform into cache (with LRU eviction)
     fn insert_waveform(&mut self, track_num: u8, waveform_data: WaveformData, duration_str: String) {
         self.waveform_cache.insert(track_num, WaveformCache {
             waveform_data,
@@ -233,30 +398,21 @@ impl AppState {
         });
     }
 
-    /// Get peaks for current zoom level and scroll offset for the displayed track
-    fn get_visible_peaks(&self) -> Vec<WaveformPeak> {
-        let Some(track_num) = self.displayed_track_num else {
-            return Vec::new();
-        };
-
-        let Some(cache) = self.waveform_cache.get(&track_num) else {
-            return Vec::new();
-        };
-
-        // Calculate visible range based on zoom and scroll
-        let view_size = 1.0 / self.zoom_level;
-        let start = self.scroll_offset;
-        let end = (start + view_size).min(1.0);
-
-        // Get peaks for the visible range
-        let peaks = cache.waveform_data.get_peaks_for_range(start, end, WAVEFORM_BINS);
-        peaks.iter().map(|&(min, max)| WaveformPeak { min, max }).collect()
+    /// Access a cached waveform, updating LRU order (call when actively viewing)
+    fn access_cached_waveform(&mut self, track_num: u8) -> Option<&WaveformCache> {
+        self.waveform_cache.get(&track_num)
     }
 
-    /// Get visible peaks for a specific track from cache
-    fn get_visible_peaks_for_track(&self, track_num: u8) -> Vec<WaveformPeak> {
-        let Some(cache) = self.waveform_cache.get(&track_num) else {
-            return Vec::new();
+    /// Get SVG path for current zoom level and scroll offset for the displayed track
+    ///
+    /// Uses a reusable buffer to avoid allocation on each zoom/scroll operation.
+    fn get_visible_path(&mut self, width: f32, height: f32) -> String {
+        let Some(track_num) = self.displayed_track_num else {
+            return String::new();
+        };
+
+        let Some(cache) = self.waveform_cache.peek(&track_num) else {
+            return String::new();
         };
 
         // Calculate visible range based on zoom and scroll
@@ -264,9 +420,36 @@ impl AppState {
         let start = self.scroll_offset;
         let end = (start + view_size).min(1.0);
 
-        // Get peaks for the visible range
-        let peaks = cache.waveform_data.get_peaks_for_range(start, end, WAVEFORM_BINS);
-        peaks.iter().map(|&(min, max)| WaveformPeak { min, max }).collect()
+        // Get peaks for the visible range using reusable buffer
+        cache.waveform_data.get_peaks_for_range_into(start, end, WAVEFORM_BINS, &mut self.peaks_buffer);
+        peaks_to_svg_path(&self.peaks_buffer, width, height, true)
+    }
+
+    /// Get SVG path for a specific track from cache
+    ///
+    /// Uses a reusable buffer to avoid allocation on each zoom/scroll operation.
+    fn get_visible_path_for_track(&mut self, track_num: u8, width: f32, height: f32) -> String {
+        let Some(cache) = self.waveform_cache.peek(&track_num) else {
+            return String::new();
+        };
+
+        // Calculate visible range based on zoom and scroll
+        let view_size = 1.0 / self.zoom_level;
+        let start = self.scroll_offset;
+        let end = (start + view_size).min(1.0);
+
+        // Get peaks for the visible range using reusable buffer
+        cache.waveform_data.get_peaks_for_range_into(start, end, WAVEFORM_BINS, &mut self.peaks_buffer);
+        peaks_to_svg_path(&self.peaks_buffer, width, height, true)
+    }
+
+    /// Check if there's a waveform to display
+    fn has_visible_waveform(&self) -> bool {
+        if let Some(track_num) = self.displayed_track_num {
+            self.waveform_cache.contains_key(&track_num)
+        } else {
+            false
+        }
     }
 }
 
@@ -377,15 +560,15 @@ fn main() -> Result<(), slint::PlatformError> {
             state.save_preferences();
 
             if let Some(app) = app_weak.upgrade() {
-                let tracks: Vec<TrackData> = state.tracks_to_model();
-                let model = Rc::new(slint::VecModel::from(tracks));
+                let model = state.initialize_tracks_model();
                 app.set_tracks(model.into());
                 app.set_album(state.album_to_model());
                 app.set_status_message(format!("Created project: {}", project_dir.display()).into());
                 app.set_selected_track_index(-1);
                 app.set_has_project(true);
                 // Clear waveform
-                app.set_waveform_peaks(Rc::new(slint::VecModel::from(Vec::<WaveformPeak>::new())).into());
+                app.set_waveform_path("".into());
+                app.set_has_waveform(false);
                 app.set_waveform_duration("0:00".into());
             }
         }
@@ -431,15 +614,15 @@ fn main() -> Result<(), slint::PlatformError> {
                     state.save_preferences();
 
                     if let Some(app) = app_weak.upgrade() {
-                        let tracks: Vec<TrackData> = state.tracks_to_model();
-                        let model = Rc::new(slint::VecModel::from(tracks));
+                        let model = state.initialize_tracks_model();
                         app.set_tracks(model.into());
                         app.set_album(state.album_to_model());
                         app.set_status_message(format!("Opened: {}", path.display()).into());
                         app.set_selected_track_index(-1);
                         app.set_has_project(true);
                         // Clear waveform
-                        app.set_waveform_peaks(Rc::new(slint::VecModel::from(Vec::<WaveformPeak>::new())).into());
+                        app.set_waveform_path("".into());
+                        app.set_has_waveform(false);
                         app.set_waveform_duration("0:00".into());
                     }
                 }
@@ -490,8 +673,22 @@ fn main() -> Result<(), slint::PlatformError> {
         }
     });
 
+    // Shared containers for async file reading when adding tracks (thread-safe)
+    // Stores the pending request: list of file paths to read
+    let add_tracks_pending: Arc<std::sync::Mutex<Option<Vec<PathBuf>>>> =
+        Arc::new(std::sync::Mutex::new(None));
+    // Stores the results: list of (path, WavInfo) or (path, error_message)
+    type AddTracksResult = Vec<Result<(PathBuf, WavInfo), (PathBuf, String)>>;
+    let add_tracks_result: Arc<std::sync::Mutex<Option<AddTracksResult>>> =
+        Arc::new(std::sync::Mutex::new(None));
+    // Flag indicating if a file reading worker thread is currently running
+    let add_tracks_worker_active: Arc<AtomicBool> = Arc::new(AtomicBool::new(false));
+
     let app_weak = app.as_weak();
     let state_clone = state.clone();
+    let at_pending = add_tracks_pending.clone();
+    let at_result = add_tracks_result.clone();
+    let at_worker_active = add_tracks_worker_active.clone();
     app.on_add_tracks(move || {
         // First check if we have a project
         {
@@ -509,99 +706,77 @@ fn main() -> Result<(), slint::PlatformError> {
             .set_title("Select WAV files to add");
 
         if let Some(files) = dialog.pick_files() {
-            let mut state = state_clone.borrow_mut();
+            if files.is_empty() {
+                return;
+            }
 
-            let Some(project) = state.project.as_mut() else {
-                return; // Project was closed while dialog was open
-            };
-            let mut added = 0;
-            let mut needs_transcoding: Vec<(PathBuf, WavInfo)> = Vec::new();
+            // Check project still exists
+            {
+                let state = state_clone.borrow();
+                if state.project.is_none() {
+                    return;
+                }
+            }
 
-            for path in files {
-                match read_wav_info(&path) {
-                    Ok(info) => {
-                        if info.is_red_book_compliant() {
-                            // Get title from filename
-                            let title = path.file_stem()
-                                .and_then(|s| s.to_str())
-                                .unwrap_or("Unknown")
-                                .to_string();
+            let file_count = files.len();
 
-                            let track_num = project.album.track_count() + 1;
+            // Show loading status
+            if let Some(app) = app_weak.upgrade() {
+                app.set_adding_tracks(true);
+                app.set_status_message(format!("Reading {} file(s)...", file_count).into());
+            }
 
-                            // Create track with ABSOLUTE path (no copying)
-                            let track = Track::new(
-                                track_num as u8,
-                                title,
-                                path.clone(),  // Store original absolute path
-                                info.duration,
-                            );
-                            project.album.add_track(track);
-                            added += 1;
-                        } else {
-                            // Collect non-compliant files for transcoding dialog
-                            needs_transcoding.push((path, info));
+            // Store pending request
+            if let Ok(mut pending) = at_pending.lock() {
+                *pending = Some(files);
+            }
+
+            // Spawn worker thread if not already running
+            if !at_worker_active.swap(true, Ordering::SeqCst) {
+                let pending_clone = at_pending.clone();
+                let result_clone = at_result.clone();
+                let worker_active_clone = at_worker_active.clone();
+
+                std::thread::spawn(move || {
+                    loop {
+                        // Get the pending request (take it, leaving None)
+                        let request = {
+                            let mut pending = pending_clone.lock().expect("mutex poisoned");
+                            pending.take()
+                        };
+
+                        let Some(paths) = request else {
+                            break; // No more requests
+                        };
+
+                        // Read all files (the slow part - done in background)
+                        let results: Vec<Result<(PathBuf, WavInfo), (PathBuf, String)>> = paths
+                            .into_iter()
+                            .map(|path| {
+                                match read_wav_info(&path) {
+                                    Ok(info) => Ok((path, info)),
+                                    Err(e) => Err((path, e.to_string())),
+                                }
+                            })
+                            .collect();
+
+                        // Store results for UI thread to pick up
+                        if let Ok(mut result) = result_clone.lock() {
+                            *result = Some(results);
+                        }
+
+                        // Check for more pending requests
+                        let has_pending = {
+                            let pending = pending_clone.lock().expect("mutex poisoned");
+                            pending.is_some()
+                        };
+
+                        if !has_pending {
+                            break;
                         }
                     }
-                    Err(e) => {
-                        eprintln!("Failed to read WAV: {}", e);
-                    }
-                }
-            }
-
-            // Auto-save project after adding tracks
-            if added > 0 {
-                state.auto_save();
-            }
-
-            if let Some(app) = app_weak.upgrade() {
-                // Update track list with compliant files added so far
-                let tracks: Vec<TrackData> = state.tracks_to_model();
-                let model = Rc::new(slint::VecModel::from(tracks));
-                app.set_tracks(model.into());
-                app.set_album(state.album_to_model());
-
-                if !needs_transcoding.is_empty() {
-                    // Build transcode file info for dialog
-                    let transcode_infos: Vec<TranscodeFileInfo> = needs_transcoding.iter()
-                        .map(|(path, info)| {
-                            let filename = path.file_name()
-                                .and_then(|s| s.to_str())
-                                .unwrap_or("Unknown")
-                                .to_string();
-
-                            // Format issues in a user-friendly way
-                            let issues = info.format_issues().join(", ")
-                                .replace("Hz (needs 44100Hz)", "Hz → 44100Hz")
-                                .replace("bits (needs 16 bits)", "-bit → 16-bit")
-                                .replace("(needs stereo)", "→ Stereo");
-
-                            TranscodeFileInfo {
-                                filename: filename.into(),
-                                issues: issues.into(),
-                                path: path.to_string_lossy().to_string().into(),
-                            }
-                        })
-                        .collect();
-
-                    // Store pending files and show dialog
-                    state.pending_transcode_files = needs_transcoding;
-
-                    let model = Rc::new(slint::VecModel::from(transcode_infos));
-                    app.set_transcode_files(model.into());
-                    app.set_show_transcode_dialog(true);
-                    app.set_is_transcoding(false);
-                    app.set_transcode_progress(0.0);
-                    app.set_transcode_status("".into());
-
-                    app.set_status_message(format!(
-                        "Added {} track(s), {} need conversion",
-                        added,
-                        state.pending_transcode_files.len()
-                    ).into());
-                } else {
-                    app.set_status_message(format!("Added {} track(s)", added).into());
-                }
+                    worker_active_clone.store(false, Ordering::SeqCst);
+                });
             }
         }
     });
@@ -684,18 +859,20 @@ fn main() -> Result<(), slint::PlatformError> {
         state.scroll_offset = 0.0;
 
         // Check if waveform is already cached
-        if state.get_cached_waveform(track_num_u8).is_some() {
-            // Cache hit - update UI immediately
-            let peaks = state.get_visible_peaks_for_track(track_num_u8);
-            let duration = state.waveform_cache.get(&track_num_u8)
+        if state.has_cached_waveform(track_num_u8) {
+            // Cache hit - update LRU order and get data
+            let _ = state.access_cached_waveform(track_num_u8); // Update LRU order
+            let path = state.get_visible_path_for_track(track_num_u8, WAVEFORM_PATH_WIDTH, WAVEFORM_PATH_HEIGHT);
+            let duration = state.waveform_cache.peek(&track_num_u8)
                 .map(|c| c.duration_str.clone())
                 .unwrap_or_default();
+            let has_waveform = !path.is_empty();
 
             drop(state); // Release borrow before UI updates
 
             if let Some(app) = app_weak.upgrade() {
-                let model = Rc::new(slint::VecModel::from(peaks));
-                app.set_waveform_peaks(model.into());
+                app.set_waveform_path(path.into());
+                app.set_has_waveform(has_waveform);
                 app.set_waveform_duration(duration.into());
                 app.set_waveform_loading(false);
                 app.set_zoom_level(1.0);
@@ -714,7 +891,8 @@ fn main() -> Result<(), slint::PlatformError> {
             app.set_status_message(format!("Loading waveform for track {}...", track_num).into());
             app.set_playhead_position(0.0);
             // Clear waveform display while loading
-            app.set_waveform_peaks(Rc::new(slint::VecModel::from(Vec::<WaveformPeak>::new())).into());
+            app.set_waveform_path("".into());
+            app.set_has_waveform(false);
         }
 
         // Get track info for background thread
@@ -806,20 +984,23 @@ fn main() -> Result<(), slint::PlatformError> {
     });
 
     let state_clone = state.clone();
-    let app_weak = app.as_weak();
     app.on_update_track_title(move |track_num, title| {
         let mut state = state_clone.borrow_mut();
-        if let Some(ref mut project) = state.project {
-            if let Some(track) = project.album.get_track_mut(track_num as u8) {
-                track.title = title.to_string();
-                if let Some(app) = app_weak.upgrade() {
-                    let tracks: Vec<TrackData> = state.tracks_to_model();
-                    let model = Rc::new(slint::VecModel::from(tracks));
-                    app.set_tracks(model.into());
+        // Update the track in the project (scoped to release borrow)
+        {
+            if let Some(ref mut project) = state.project {
+                if let Some(track) = project.album.get_track_mut(track_num as u8) {
+                    track.title = title.to_string();
+                } else {
+                    return;
                 }
-                state.auto_save();
+            } else {
+                return;
             }
         }
+        // Update the model in-place (project borrow released)
+        state.update_track_title_in_model(track_num as u8, &title);
+        state.auto_save();
     });
 
     // Playback callbacks
@@ -941,7 +1122,7 @@ fn main() -> Result<(), slint::PlatformError> {
         let Some(track_num) = state.displayed_track_num else {
             return;
         };
-        if state.waveform_cache.get(&track_num).is_none() {
+        if !state.has_cached_waveform(track_num) {
             return;
         }
 
@@ -955,14 +1136,15 @@ fn main() -> Result<(), slint::PlatformError> {
         let center = state.scroll_offset + old_view_size / 2.0;
         state.scroll_offset = (center - new_view_size / 2.0).max(0.0).min(1.0 - new_view_size);
 
-        // Get updated peaks for new zoom level
-        let peaks = state.get_visible_peaks();
+        // Get updated path for new zoom level
+        let path = state.get_visible_path(WAVEFORM_PATH_WIDTH, WAVEFORM_PATH_HEIGHT);
+        let has_waveform = state.has_visible_waveform();
         let zoom_level = state.zoom_level;
         let scroll_offset = state.scroll_offset;
 
         if let Some(app) = app_weak.upgrade() {
-            let model = Rc::new(slint::VecModel::from(peaks));
-            app.set_waveform_peaks(model.into());
+            app.set_waveform_path(path.into());
+            app.set_has_waveform(has_waveform);
             app.set_zoom_level(zoom_level);
             app.set_waveform_scroll_offset(scroll_offset);
         }
@@ -975,7 +1157,7 @@ fn main() -> Result<(), slint::PlatformError> {
         let Some(track_num) = state.displayed_track_num else {
             return;
         };
-        if state.waveform_cache.get(&track_num).is_none() {
+        if !state.has_cached_waveform(track_num) {
             return;
         }
 
@@ -989,14 +1171,15 @@ fn main() -> Result<(), slint::PlatformError> {
         let center = state.scroll_offset + old_view_size / 2.0;
         state.scroll_offset = (center - new_view_size / 2.0).max(0.0).min(1.0 - new_view_size);
 
-        // Get updated peaks for new zoom level
-        let peaks = state.get_visible_peaks();
+        // Get updated path for new zoom level
+        let path = state.get_visible_path(WAVEFORM_PATH_WIDTH, WAVEFORM_PATH_HEIGHT);
+        let has_waveform = state.has_visible_waveform();
         let zoom_level = state.zoom_level;
         let scroll_offset = state.scroll_offset;
 
         if let Some(app) = app_weak.upgrade() {
-            let model = Rc::new(slint::VecModel::from(peaks));
-            app.set_waveform_peaks(model.into());
+            app.set_waveform_path(path.into());
+            app.set_has_waveform(has_waveform);
             app.set_zoom_level(zoom_level);
             app.set_waveform_scroll_offset(scroll_offset);
         }
@@ -1009,7 +1192,7 @@ fn main() -> Result<(), slint::PlatformError> {
         let Some(track_num) = state.displayed_track_num else {
             return;
         };
-        if state.waveform_cache.get(&track_num).is_none() || state.zoom_level <= 1.0 {
+        if !state.has_cached_waveform(track_num) || state.zoom_level <= 1.0 {
             return; // No scrolling at 1x zoom
         }
 
@@ -1020,13 +1203,14 @@ fn main() -> Result<(), slint::PlatformError> {
         // Update scroll offset
         state.scroll_offset = (state.scroll_offset + delta * 0.1).max(0.0).min(max_scroll);
 
-        // Get updated peaks for new scroll position
-        let peaks = state.get_visible_peaks();
+        // Get updated path for new scroll position
+        let path = state.get_visible_path(WAVEFORM_PATH_WIDTH, WAVEFORM_PATH_HEIGHT);
+        let has_waveform = state.has_visible_waveform();
         let scroll_offset = state.scroll_offset;
 
         if let Some(app) = app_weak.upgrade() {
-            let model = Rc::new(slint::VecModel::from(peaks));
-            app.set_waveform_peaks(model.into());
+            app.set_waveform_path(path.into());
+            app.set_has_waveform(has_waveform);
             app.set_waveform_scroll_offset(scroll_offset);
         }
     });
@@ -1708,7 +1892,8 @@ fn main() -> Result<(), slint::PlatformError> {
     let state_clone = state.clone();
     let app_weak = app.as_weak();
     app.on_remove_track(move |track_num| {
-        let removed = {
+        // First: remove from project and get the removed index
+        let removed_idx = {
             let mut state = state_clone.borrow_mut();
             if let Some(ref mut project) = state.project {
                 // Find track index by number
@@ -1723,20 +1908,25 @@ fn main() -> Result<(), slint::PlatformError> {
                     state.displayed_track_num = None;
 
                     state.auto_save();
-                    true
+                    Some(idx)
                 } else {
-                    false
+                    None
                 }
             } else {
-                false
+                None
             }
         };
 
-        if removed {
-            // Gather all UI update data while holding the borrow
-            let (tracks, new_count, new_track_num) = {
+        if let Some(idx) = removed_idx {
+            // Update the model in-place
+            {
                 let state = state_clone.borrow();
-                let tracks = state.tracks_to_model();
+                state.remove_and_renumber_model(idx);
+            }
+
+            // Gather remaining UI update data
+            let (new_count, new_track_num) = {
+                let state = state_clone.borrow();
                 let new_count = state.project.as_ref().map(|p| p.album.tracks.len()).unwrap_or(0) as i32;
 
                 // Get track number for the new selection
@@ -1755,19 +1945,17 @@ fn main() -> Result<(), slint::PlatformError> {
                     None
                 };
 
-                (tracks, new_count, new_track_num)
+                (new_count, new_track_num)
             };
 
             // Now update UI without holding borrows
             if let Some(app) = app_weak.upgrade() {
-                let model = std::rc::Rc::new(slint::VecModel::from(tracks));
-                app.set_tracks(model.into());
-
                 if new_count == 0 {
                     app.set_selected_track_index(-1);
                     app.set_current_track_title("".into());
                     app.set_current_track_pregap("0".into());
-                    app.set_waveform_peaks(std::rc::Rc::new(slint::VecModel::from(Vec::<WaveformPeak>::new())).into());
+                    app.set_waveform_path("".into());
+                    app.set_has_waveform(false);
                     app.set_waveform_duration("0:00".into());
                 } else if let Some(track_num) = new_track_num {
                     // Use invoke_select_track to handle async waveform loading
@@ -1779,22 +1967,27 @@ fn main() -> Result<(), slint::PlatformError> {
     });
 
     let state_clone = state.clone();
-    let app_weak = app.as_weak();
     app.on_update_track_pregap(move |track_num, pregap| {
         let mut state = state_clone.borrow_mut();
-        if let Some(ref mut project) = state.project {
-            if let Ok(secs) = pregap.parse::<u64>() {
+        let secs = match pregap.parse::<u64>() {
+            Ok(s) => s,
+            Err(_) => return,
+        };
+        // Update the track in the project (scoped to release borrow)
+        {
+            if let Some(ref mut project) = state.project {
                 if let Some(track) = project.album.get_track_mut(track_num as u8) {
                     track.pregap = std::time::Duration::from_secs(secs);
-                    if let Some(app) = app_weak.upgrade() {
-                        let tracks: Vec<TrackData> = state.tracks_to_model();
-                        let model = Rc::new(slint::VecModel::from(tracks));
-                        app.set_tracks(model.into());
-                    }
-                    state.auto_save();
+                } else {
+                    return;
                 }
+            } else {
+                return;
             }
         }
+        // Update the model in-place (project borrow released)
+        state.update_track_pregap_in_model(track_num as u8, secs);
+        state.auto_save();
     });
 
     // Track reordering via drag-and-drop
@@ -1805,7 +1998,7 @@ fn main() -> Result<(), slint::PlatformError> {
         let to_idx = to_index as usize;
 
         // Reorder tracks and get data for UI update
-        let (tracks, track_num) = {
+        let (model, track_num) = {
             let mut state = state_clone.borrow_mut();
             let Some(ref mut project) = state.project else {
                 return;
@@ -1839,21 +2032,19 @@ fn main() -> Result<(), slint::PlatformError> {
             // Get track number for the moved track (now at insert_idx)
             let track_num = project.album.tracks.get(insert_idx).map(|t| t.number as i32);
 
-            // Prepare UI data
-            let tracks = state.tracks_to_model();
-
             // Invalidate waveform cache since track numbers changed
             state.waveform_cache.clear();
             state.displayed_track_num = None;
 
             state.auto_save();
 
-            (tracks, track_num)
+            // Full rebuild for reorder (complex renumbering)
+            let model = state.initialize_tracks_model();
+            (model, track_num)
         };
 
         // Update UI
         if let Some(app) = app_weak.upgrade() {
-            let model = Rc::new(slint::VecModel::from(tracks));
             app.set_tracks(model.into());
 
             // Use invoke_select_track to handle async waveform loading
@@ -2052,6 +2243,8 @@ fn main() -> Result<(), slint::PlatformError> {
     let completed_for_timer = completed_conversions.clone();
     let done_for_timer = conversion_done.clone();
     let waveform_result_for_timer = waveform_result.clone();
+    // Add tracks async state for timer polling
+    let add_tracks_result_for_timer = add_tracks_result.clone();
     // Burn state for timer polling
     let burn_log_timer = burn_log.clone();
     let burn_complete_timer = burn_complete.clone();
@@ -2075,14 +2268,148 @@ fn main() -> Result<(), slint::PlatformError> {
 
                         // Update UI only if this is still the displayed track
                         if state.displayed_track_num == Some(track_num) {
-                            let peaks = state.get_visible_peaks();
+                            let path = state.get_visible_path(WAVEFORM_PATH_WIDTH, WAVEFORM_PATH_HEIGHT);
+                            let has_waveform = state.has_visible_waveform();
                             drop(state); // Release borrow before UI updates
 
-                            let model = Rc::new(slint::VecModel::from(peaks));
-                            app.set_waveform_peaks(model.into());
+                            app.set_waveform_path(path.into());
+                            app.set_has_waveform(has_waveform);
                             app.set_waveform_duration(duration_str.into());
                             app.set_waveform_loading(false);
                             app.set_status_message(format!("Track {} loaded", track_num).into());
+                        }
+                    }
+                }
+            }
+
+            // Check for completed file reading (add tracks async)
+            if let Ok(mut result) = add_tracks_result_for_timer.try_lock() {
+                if let Some(results) = result.take() {
+                    if let Some(app) = app_weak.upgrade() {
+                        let mut state = state_for_timer.borrow_mut();
+
+                        // Clone model reference before borrowing project (avoids borrow conflict)
+                        let tracks_model = state.tracks_model.clone();
+
+                        if let Some(project) = state.project.as_mut() {
+                            let mut added = 0;
+                            let mut needs_transcoding: Vec<(PathBuf, WavInfo)> = Vec::new();
+                            let mut errors: Vec<String> = Vec::new();
+
+                            for file_result in results {
+                                match file_result {
+                                    Ok((path, info)) => {
+                                        if info.is_red_book_compliant() {
+                                            // Get title from filename
+                                            let title = path.file_stem()
+                                                .and_then(|s| s.to_str())
+                                                .unwrap_or("Unknown")
+                                                .to_string();
+
+                                            let track_num = project.album.track_count() + 1;
+
+                                            // Create track with ABSOLUTE path (no copying)
+                                            let track = Track::new(
+                                                track_num as u8,
+                                                title,
+                                                path.clone(),
+                                                info.duration,
+                                            );
+                                            project.album.add_track(track);
+
+                                            // Push to model without rebuilding (if model exists)
+                                            if let (Some(ref model), Some(track)) = (&tracks_model, project.album.tracks.last()) {
+                                                let track_data = TrackData {
+                                                    number: track.number as i32,
+                                                    title: track.title.clone().into(),
+                                                    duration: format_duration_ms(track.duration).into(),
+                                                    pregap: track.pregap.as_secs().to_string().into(),
+                                                    postgap: track.postgap.as_secs().to_string().into(),
+                                                    selected: false,
+                                                };
+                                                model.push(track_data);
+                                            }
+                                            added += 1;
+                                        } else {
+                                            // Collect non-compliant files for transcoding dialog
+                                            needs_transcoding.push((path, info));
+                                        }
+                                    }
+                                    Err((path, error)) => {
+                                        let filename = path.file_name()
+                                            .and_then(|n| n.to_str())
+                                            .unwrap_or("Unknown");
+                                        errors.push(format!("{}: {}", filename, error));
+                                    }
+                                }
+                            }
+
+                            // Auto-save project after adding tracks
+                            if added > 0 {
+                                state.auto_save();
+                            }
+
+                            // Only rebuild model if it doesn't exist (tracks were pushed incrementally)
+                            if state.tracks_model.is_none() {
+                                let model = state.initialize_tracks_model();
+                                app.set_tracks(model.into());
+                            }
+                            app.set_album(state.album_to_model());
+
+                            // Hide loading indicator
+                            app.set_adding_tracks(false);
+
+                            // Show errors if any
+                            if !errors.is_empty() {
+                                show_error_dialog(&app, "File Read Errors",
+                                    &format!("Some files could not be read:\n\n{}", errors.join("\n")));
+                            }
+
+                            if !needs_transcoding.is_empty() {
+                                // Build transcode file info for dialog
+                                let transcode_infos: Vec<TranscodeFileInfo> = needs_transcoding.iter()
+                                    .map(|(path, info)| {
+                                        let filename = path.file_name()
+                                            .and_then(|s| s.to_str())
+                                            .unwrap_or("Unknown")
+                                            .to_string();
+
+                                        // Format issues in a user-friendly way
+                                        let issues = info.format_issues().join(", ")
+                                            .replace("Hz (needs 44100Hz)", "Hz → 44100Hz")
+                                            .replace("bits (needs 16 bits)", "-bit → 16-bit")
+                                            .replace("(needs stereo)", "→ Stereo");
+
+                                        TranscodeFileInfo {
+                                            filename: filename.into(),
+                                            issues: issues.into(),
+                                            path: path.to_string_lossy().to_string().into(),
+                                        }
+                                    })
+                                    .collect();
+
+                                // Store pending files and show dialog
+                                state.pending_transcode_files = needs_transcoding;
+
+                                let model = Rc::new(slint::VecModel::from(transcode_infos));
+                                app.set_transcode_files(model.into());
+                                app.set_show_transcode_dialog(true);
+                                app.set_is_transcoding(false);
+                                app.set_transcode_progress(0.0);
+                                app.set_transcode_status("".into());
+
+                                app.set_status_message(format!(
+                                    "Added {} track(s), {} need conversion",
+                                    added,
+                                    state.pending_transcode_files.len()
+                                ).into());
+                            } else {
+                                app.set_status_message(format!("Added {} track(s)", added).into());
+                            }
+                        } else {
+                            // Project was closed while reading files
+                            app.set_adding_tracks(false);
+                            app.set_status_message("Project closed".into());
                         }
                     }
                 }
@@ -2100,6 +2427,9 @@ fn main() -> Result<(), slint::PlatformError> {
                 if !converted_paths.is_empty() {
                     if let Some(app) = app_weak.upgrade() {
                         let mut state = state_for_timer.borrow_mut();
+
+                        // Clone model reference before borrowing project (avoids borrow conflict)
+                        let tracks_model = state.tracks_model.clone();
 
                         if let Some(project) = state.project.as_mut() {
                             let mut added = 0;
@@ -2125,15 +2455,29 @@ fn main() -> Result<(), slint::PlatformError> {
                                     duration,
                                 );
                                 project.album.add_track(track);
+
+                                // Push to model without rebuilding (if model exists)
+                                if let (Some(ref model), Some(track)) = (&tracks_model, project.album.tracks.last()) {
+                                    let track_data = TrackData {
+                                        number: track.number as i32,
+                                        title: track.title.clone().into(),
+                                        duration: format_duration_ms(track.duration).into(),
+                                        pregap: track.pregap.as_secs().to_string().into(),
+                                        postgap: track.postgap.as_secs().to_string().into(),
+                                        selected: false,
+                                    };
+                                    model.push(track_data);
+                                }
                                 added += 1;
                             }
 
                             state.auto_save();
 
-                            // Update UI
-                            let tracks: Vec<TrackData> = state.tracks_to_model();
-                            let model = Rc::new(slint::VecModel::from(tracks));
-                            app.set_tracks(model.into());
+                            // Only rebuild model if it doesn't exist (tracks were pushed incrementally)
+                            if tracks_model.is_none() {
+                                let model = state.initialize_tracks_model();
+                                app.set_tracks(model.into());
+                            }
                             app.set_show_transcode_dialog(false);
                             app.set_is_transcoding(false);
                             app.set_status_message(format!("Converted and added {} track(s)", added).into());
@@ -2318,9 +2662,17 @@ fn main() -> Result<(), slint::PlatformError> {
                 }
             }
 
-            // Periodic window size check (every ~2 seconds)
+            // Periodic checks
             let count = window_check_counter.get() + 1;
             window_check_counter.set(count);
+
+            // Flush pending auto-save (every ~1 second = 20 ticks at 50ms)
+            if count % 20 == 0 {
+                let mut state = state_for_timer.borrow_mut();
+                state.flush_pending_save();
+            }
+
+            // Window size check (every ~2 seconds = 40 ticks at 50ms)
             if count % 40 == 0 {
                 if let Some(app) = app_weak.upgrade() {
                     let size = app.window().size();
@@ -2345,5 +2697,10 @@ fn main() -> Result<(), slint::PlatformError> {
     // Keep timer alive by moving it into a variable that lives until app.run() completes
     let _timer = timer;
 
-    app.run()
+    let result = app.run();
+
+    // Force save any pending changes before exiting
+    state.borrow_mut().force_save();
+
+    result
 }

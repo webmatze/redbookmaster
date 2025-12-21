@@ -43,7 +43,7 @@ pub fn convert_to_red_book(input: &Path, output: &Path) -> Result<ConversionResu
     convert_wav(input, output, ConvertOptions::red_book())
 }
 
-/// Convert a WAV file with custom options
+/// Convert a WAV file with custom options (streaming, memory-efficient)
 pub fn convert_wav(
     input: &Path,
     output: &Path,
@@ -60,33 +60,6 @@ pub fn convert_wav(
     let needs_bit_convert = input_spec.bits_per_sample != options.bits_per_sample;
     let needs_channel_convert = input_spec.channels != options.channels;
 
-    // Read all samples as f64 for processing
-    let samples = read_samples_as_f64(&mut reader, input_spec)?;
-
-    // Apply conversions in order: channels -> resample -> bit depth
-    let samples = if needs_channel_convert {
-        convert_channels(&samples, input_spec.channels, options.channels)?
-    } else {
-        samples
-    };
-
-    let current_channels = if needs_channel_convert {
-        options.channels
-    } else {
-        input_spec.channels
-    };
-
-    let samples = if needs_resample {
-        resample(
-            &samples,
-            current_channels as usize,
-            input_spec.sample_rate,
-            options.sample_rate,
-        )?
-    } else {
-        samples
-    };
-
     // Write output file
     let output_spec = WavSpec {
         channels: options.channels,
@@ -95,7 +68,33 @@ pub fn convert_wav(
         sample_format: SampleFormat::Int,
     };
 
-    write_samples(output, output_spec, &samples, options.dither)?;
+    let mut writer = WavWriter::create(output, output_spec)
+        .map_err(|e| ConvertError::WriteError(output.to_path_buf(), e.to_string()))?;
+
+    // Process using streaming
+    if needs_resample {
+        // Use chunked processing with resampler
+        convert_with_resampling(
+            &mut reader,
+            &mut writer,
+            input_spec,
+            &options,
+            needs_channel_convert,
+        )?;
+    } else {
+        // Simple streaming without resampling (much simpler)
+        convert_streaming_no_resample(
+            &mut reader,
+            &mut writer,
+            input_spec,
+            &options,
+            needs_channel_convert,
+        )?;
+    }
+
+    writer
+        .finalize()
+        .map_err(|e| ConvertError::WriteError(output.to_path_buf(), e.to_string()))?;
 
     Ok(ConversionResult {
         input_sample_rate: input_spec.sample_rate,
@@ -110,70 +109,280 @@ pub fn convert_wav(
     })
 }
 
-/// Read all samples from a WAV file as f64 (normalized to -1.0..1.0)
-fn read_samples_as_f64(
+/// Streaming conversion without resampling (memory-efficient)
+fn convert_streaming_no_resample<W: std::io::Write + std::io::Seek>(
+    reader: &mut WavReader<std::io::BufReader<std::fs::File>>,
+    writer: &mut WavWriter<W>,
+    input_spec: WavSpec,
+    options: &ConvertOptions,
+    needs_channel_convert: bool,
+) -> Result<(), ConvertError> {
+    const CHUNK_FRAMES: usize = 8192;
+    let in_channels = input_spec.channels as usize;
+    let chunk_samples = CHUNK_FRAMES * in_channels;
+
+    let mut dither_state: u32 = 12345;
+    let mut next_dither = || -> f64 {
+        if !options.dither {
+            return 0.0;
+        }
+        dither_state = dither_state.wrapping_mul(1103515245).wrapping_add(12345);
+        let r1 = (dither_state >> 16) as f64 / 32768.0 - 1.0;
+        dither_state = dither_state.wrapping_mul(1103515245).wrapping_add(12345);
+        let r2 = (dither_state >> 16) as f64 / 32768.0 - 1.0;
+        (r1 + r2) * 0.5
+    };
+
+    // Process in chunks
+    let mut input_buffer: Vec<f64> = Vec::with_capacity(chunk_samples);
+
+    // Read and convert samples
+    let sample_iter = create_sample_iterator(reader, input_spec)?;
+
+    for sample in sample_iter {
+        input_buffer.push(sample);
+
+        if input_buffer.len() >= chunk_samples {
+            // Process this chunk
+            let converted = if needs_channel_convert {
+                convert_channels(&input_buffer, input_spec.channels, options.channels)?
+            } else {
+                std::mem::take(&mut input_buffer)
+            };
+
+            write_chunk_to_wav(writer, &converted, options.bits_per_sample, &mut next_dither)?;
+
+            if !needs_channel_convert {
+                input_buffer = Vec::with_capacity(chunk_samples);
+            } else {
+                input_buffer.clear();
+            }
+        }
+    }
+
+    // Process remaining samples
+    if !input_buffer.is_empty() {
+        let converted = if needs_channel_convert {
+            convert_channels(&input_buffer, input_spec.channels, options.channels)?
+        } else {
+            input_buffer
+        };
+        write_chunk_to_wav(writer, &converted, options.bits_per_sample, &mut next_dither)?;
+    }
+
+    Ok(())
+}
+
+/// Streaming conversion with resampling (memory-efficient)
+fn convert_with_resampling<W: std::io::Write + std::io::Seek>(
+    reader: &mut WavReader<std::io::BufReader<std::fs::File>>,
+    writer: &mut WavWriter<W>,
+    input_spec: WavSpec,
+    options: &ConvertOptions,
+    needs_channel_convert: bool,
+) -> Result<(), ConvertError> {
+    let in_channels = input_spec.channels as usize;
+    let out_channels = options.channels as usize;
+    let working_channels = if needs_channel_convert { out_channels } else { in_channels };
+
+    // Create resampler
+    let chunk_size = 1024;
+    let mut resampler = FftFixedInOut::<f64>::new(
+        input_spec.sample_rate as usize,
+        options.sample_rate as usize,
+        chunk_size,
+        working_channels,
+    )
+    .map_err(|e| ConvertError::ResampleError(e.to_string()))?;
+
+    let frames_needed = resampler.input_frames_next();
+    let input_chunk_samples = frames_needed * in_channels;
+
+    let mut dither_state: u32 = 12345;
+    let mut next_dither = || -> f64 {
+        if !options.dither {
+            return 0.0;
+        }
+        dither_state = dither_state.wrapping_mul(1103515245).wrapping_add(12345);
+        let r1 = (dither_state >> 16) as f64 / 32768.0 - 1.0;
+        dither_state = dither_state.wrapping_mul(1103515245).wrapping_add(12345);
+        let r2 = (dither_state >> 16) as f64 / 32768.0 - 1.0;
+        (r1 + r2) * 0.5
+    };
+
+    // Pre-allocate reusable buffers for resampling
+    let mut channel_buffers: Vec<Vec<f64>> = vec![Vec::with_capacity(frames_needed); working_channels];
+    let mut input_buffer: Vec<f64> = Vec::with_capacity(input_chunk_samples);
+
+    // Read samples
+    let sample_iter = create_sample_iterator(reader, input_spec)?;
+
+    for sample in sample_iter {
+        input_buffer.push(sample);
+
+        if input_buffer.len() >= input_chunk_samples {
+            // Convert channels if needed
+            let working_buffer = if needs_channel_convert {
+                convert_channels(&input_buffer, input_spec.channels, options.channels)?
+            } else {
+                std::mem::take(&mut input_buffer)
+            };
+
+            // Deinterleave into channel buffers
+            for ch in 0..working_channels {
+                channel_buffers[ch].clear();
+                for frame in 0..frames_needed {
+                    let idx = frame * working_channels + ch;
+                    if idx < working_buffer.len() {
+                        channel_buffers[ch].push(working_buffer[idx]);
+                    } else {
+                        channel_buffers[ch].push(0.0);
+                    }
+                }
+            }
+
+            // Resample
+            let output_chunk = resampler
+                .process(&channel_buffers, None)
+                .map_err(|e| ConvertError::ResampleError(e.to_string()))?;
+
+            // Interleave and write
+            let output_frames = output_chunk.get(0).map(|c| c.len()).unwrap_or(0);
+            let mut interleaved = Vec::with_capacity(output_frames * working_channels);
+            for frame in 0..output_frames {
+                for ch in &output_chunk {
+                    if frame < ch.len() {
+                        interleaved.push(ch[frame]);
+                    }
+                }
+            }
+
+            write_chunk_to_wav(writer, &interleaved, options.bits_per_sample, &mut next_dither)?;
+
+            if !needs_channel_convert {
+                input_buffer = Vec::with_capacity(input_chunk_samples);
+            } else {
+                input_buffer.clear();
+            }
+        }
+    }
+
+    // Process remaining samples (pad to frames_needed)
+    if !input_buffer.is_empty() {
+        // Convert channels if needed
+        let mut working_buffer = if needs_channel_convert {
+            convert_channels(&input_buffer, input_spec.channels, options.channels)?
+        } else {
+            input_buffer
+        };
+
+        // Pad to full chunk
+        let actual_frames = working_buffer.len() / working_channels;
+        while working_buffer.len() < frames_needed * working_channels {
+            working_buffer.push(0.0);
+        }
+
+        // Deinterleave into channel buffers
+        for ch in 0..working_channels {
+            channel_buffers[ch].clear();
+            for frame in 0..frames_needed {
+                let idx = frame * working_channels + ch;
+                channel_buffers[ch].push(working_buffer[idx]);
+            }
+        }
+
+        // Resample
+        let output_chunk = resampler
+            .process(&channel_buffers, None)
+            .map_err(|e| ConvertError::ResampleError(e.to_string()))?;
+
+        // Calculate how many output frames correspond to actual input frames
+        let ratio = options.sample_rate as f64 / input_spec.sample_rate as f64;
+        let output_frames_to_write = ((actual_frames as f64) * ratio).ceil() as usize;
+        let available_frames = output_chunk.get(0).map(|c| c.len()).unwrap_or(0);
+        let frames_to_write = output_frames_to_write.min(available_frames);
+
+        // Interleave and write
+        let mut interleaved = Vec::with_capacity(frames_to_write * working_channels);
+        for frame in 0..frames_to_write {
+            for ch in &output_chunk {
+                if frame < ch.len() {
+                    interleaved.push(ch[frame]);
+                }
+            }
+        }
+
+        write_chunk_to_wav(writer, &interleaved, options.bits_per_sample, &mut next_dither)?;
+    }
+
+    Ok(())
+}
+
+/// Create a sample iterator that converts to f64
+fn create_sample_iterator(
     reader: &mut WavReader<std::io::BufReader<std::fs::File>>,
     spec: WavSpec,
-) -> Result<Vec<f64>, ConvertError> {
-    let num_samples = reader.len() as usize;
-    let mut samples = Vec::with_capacity(num_samples);
-
+) -> Result<Box<dyn Iterator<Item = f64> + '_>, ConvertError> {
     match (spec.sample_format, spec.bits_per_sample) {
         (SampleFormat::Int, 8) => {
-            for sample in reader.samples::<i8>() {
-                let s = sample.map_err(|e| ConvertError::ReadError(
-                    std::path::PathBuf::new(),
-                    e.to_string(),
-                ))?;
-                samples.push(s as f64 / i8::MAX as f64);
-            }
+            Ok(Box::new(reader.samples::<i8>().filter_map(|s| s.ok()).map(|s| s as f64 / i8::MAX as f64)))
         }
         (SampleFormat::Int, 16) => {
-            for sample in reader.samples::<i16>() {
-                let s = sample.map_err(|e| ConvertError::ReadError(
-                    std::path::PathBuf::new(),
-                    e.to_string(),
-                ))?;
-                samples.push(s as f64 / i16::MAX as f64);
-            }
+            Ok(Box::new(reader.samples::<i16>().filter_map(|s| s.ok()).map(|s| s as f64 / i16::MAX as f64)))
         }
         (SampleFormat::Int, 24) => {
-            for sample in reader.samples::<i32>() {
-                let s = sample.map_err(|e| ConvertError::ReadError(
-                    std::path::PathBuf::new(),
-                    e.to_string(),
-                ))?;
-                // 24-bit samples are stored in i32, shift to normalize
-                samples.push(s as f64 / (1 << 23) as f64);
-            }
+            Ok(Box::new(reader.samples::<i32>().filter_map(|s| s.ok()).map(|s| s as f64 / (1 << 23) as f64)))
         }
         (SampleFormat::Int, 32) => {
-            for sample in reader.samples::<i32>() {
-                let s = sample.map_err(|e| ConvertError::ReadError(
-                    std::path::PathBuf::new(),
-                    e.to_string(),
-                ))?;
-                samples.push(s as f64 / i32::MAX as f64);
-            }
+            Ok(Box::new(reader.samples::<i32>().filter_map(|s| s.ok()).map(|s| s as f64 / i32::MAX as f64)))
         }
         (SampleFormat::Float, 32) => {
-            for sample in reader.samples::<f32>() {
-                let s = sample.map_err(|e| ConvertError::ReadError(
-                    std::path::PathBuf::new(),
-                    e.to_string(),
-                ))?;
-                samples.push(s as f64);
+            Ok(Box::new(reader.samples::<f32>().filter_map(|s| s.ok()).map(|s| s as f64)))
+        }
+        _ => Err(ConvertError::UnsupportedFormat(format!(
+            "{}-bit {:?}",
+            spec.bits_per_sample, spec.sample_format
+        ))),
+    }
+}
+
+/// Write a chunk of f64 samples to WAV with proper bit depth conversion
+fn write_chunk_to_wav<W: std::io::Write + std::io::Seek, F: FnMut() -> f64>(
+    writer: &mut WavWriter<W>,
+    samples: &[f64],
+    bits_per_sample: u16,
+    next_dither: &mut F,
+) -> Result<(), ConvertError> {
+    match bits_per_sample {
+        16 => {
+            let scale = i16::MAX as f64;
+            for &sample in samples {
+                let dithered = sample + next_dither() / scale;
+                let clamped = dithered.clamp(-1.0, 1.0);
+                let quantized = (clamped * scale).round() as i16;
+                writer.write_sample(quantized).map_err(|e| {
+                    ConvertError::WriteError(std::path::PathBuf::new(), e.to_string())
+                })?;
+            }
+        }
+        24 => {
+            let scale = (1 << 23) as f64;
+            for &sample in samples {
+                let clamped = sample.clamp(-1.0, 1.0);
+                let quantized = (clamped * scale).round() as i32;
+                writer.write_sample(quantized).map_err(|e| {
+                    ConvertError::WriteError(std::path::PathBuf::new(), e.to_string())
+                })?;
             }
         }
         _ => {
             return Err(ConvertError::UnsupportedFormat(format!(
-                "{}-bit {:?}",
-                spec.bits_per_sample, spec.sample_format
+                "Cannot write {}-bit audio",
+                bits_per_sample
             )));
         }
     }
-
-    Ok(samples)
+    Ok(())
 }
 
 /// Convert between channel counts
@@ -205,154 +414,6 @@ fn convert_channels(
         (from, to) if from == to => Ok(samples.to_vec()),
         (from, to) => Err(ConvertError::UnsupportedChannelConversion(from, to)),
     }
-}
-
-/// Resample audio using rubato
-fn resample(
-    samples: &[f64],
-    channels: usize,
-    from_rate: u32,
-    to_rate: u32,
-) -> Result<Vec<f64>, ConvertError> {
-    if from_rate == to_rate {
-        return Ok(samples.to_vec());
-    }
-
-    // Calculate resampling parameters
-    let chunk_size = 1024;
-
-    // Create resampler
-    let mut resampler = FftFixedInOut::<f64>::new(
-        from_rate as usize,
-        to_rate as usize,
-        chunk_size,
-        channels,
-    )
-    .map_err(|e| ConvertError::ResampleError(e.to_string()))?;
-
-    // Deinterleave samples into separate channels
-    let num_frames = samples.len() / channels;
-    let channel_data: Vec<Vec<f64>> = (0..channels)
-        .map(|ch| {
-            samples
-                .iter()
-                .skip(ch)
-                .step_by(channels)
-                .copied()
-                .collect()
-        })
-        .collect();
-
-    // Process in chunks
-    let frames_needed = resampler.input_frames_next();
-    let mut output_channels: Vec<Vec<f64>> = vec![Vec::new(); channels];
-
-    let mut pos = 0;
-    while pos < num_frames {
-        // Prepare input chunk
-        let chunk_frames = (num_frames - pos).min(frames_needed);
-
-        // Pad if necessary
-        let input_chunk: Vec<Vec<f64>> = channel_data
-            .iter()
-            .map(|ch| {
-                let mut chunk: Vec<f64> = ch[pos..pos + chunk_frames].to_vec();
-                // Pad with zeros if needed
-                while chunk.len() < frames_needed {
-                    chunk.push(0.0);
-                }
-                chunk
-            })
-            .collect();
-
-        // Resample
-        let output_chunk = resampler
-            .process(&input_chunk, None)
-            .map_err(|e| ConvertError::ResampleError(e.to_string()))?;
-
-        // Collect output
-        for (ch, data) in output_chunk.into_iter().enumerate() {
-            output_channels[ch].extend(data);
-        }
-
-        pos += chunk_frames;
-    }
-
-    // Interleave output channels
-    let output_frames = output_channels[0].len();
-    let mut output = Vec::with_capacity(output_frames * channels);
-
-    for frame in 0..output_frames {
-        for ch in &output_channels {
-            if frame < ch.len() {
-                output.push(ch[frame]);
-            }
-        }
-    }
-
-    Ok(output)
-}
-
-/// Write samples to a WAV file
-fn write_samples(
-    output: &Path,
-    spec: WavSpec,
-    samples: &[f64],
-    dither: bool,
-) -> Result<(), ConvertError> {
-    let mut writer = WavWriter::create(output, spec)
-        .map_err(|e| ConvertError::WriteError(output.to_path_buf(), e.to_string()))?;
-
-    // Simple TPDF dither generator
-    let mut dither_state: u32 = 12345;
-    let mut next_dither = || -> f64 {
-        if !dither {
-            return 0.0;
-        }
-        // Simple LCG for random numbers
-        dither_state = dither_state.wrapping_mul(1103515245).wrapping_add(12345);
-        let r1 = (dither_state >> 16) as f64 / 32768.0 - 1.0;
-        dither_state = dither_state.wrapping_mul(1103515245).wrapping_add(12345);
-        let r2 = (dither_state >> 16) as f64 / 32768.0 - 1.0;
-        (r1 + r2) * 0.5 // TPDF dither
-    };
-
-    match spec.bits_per_sample {
-        16 => {
-            let scale = i16::MAX as f64;
-            for &sample in samples {
-                // Apply dither before quantization
-                let dithered = sample + next_dither() / scale;
-                let clamped = dithered.clamp(-1.0, 1.0);
-                let quantized = (clamped * scale).round() as i16;
-                writer
-                    .write_sample(quantized)
-                    .map_err(|e| ConvertError::WriteError(output.to_path_buf(), e.to_string()))?;
-            }
-        }
-        24 => {
-            let scale = (1 << 23) as f64;
-            for &sample in samples {
-                let clamped = sample.clamp(-1.0, 1.0);
-                let quantized = (clamped * scale).round() as i32;
-                writer
-                    .write_sample(quantized)
-                    .map_err(|e| ConvertError::WriteError(output.to_path_buf(), e.to_string()))?;
-            }
-        }
-        _ => {
-            return Err(ConvertError::UnsupportedFormat(format!(
-                "Cannot write {}-bit audio",
-                spec.bits_per_sample
-            )));
-        }
-    }
-
-    writer
-        .finalize()
-        .map_err(|e| ConvertError::WriteError(output.to_path_buf(), e.to_string()))?;
-
-    Ok(())
 }
 
 /// Result of a WAV conversion

@@ -67,12 +67,6 @@ export struct TrackData {
     selected: bool,
 }
 
-// Waveform peak data (min, max pairs normalized to -1.0 to 1.0)
-export struct WaveformPeak {
-    min: float,
-    max: float,
-}
-
 // Album metadata
 export struct AlbumData {
     title: string,
@@ -114,7 +108,8 @@ export struct BurnSpeedOption {
 
 // Waveform display component
 component WaveformView inherits Rectangle {
-    in property <[WaveformPeak]> peaks: [];
+    in property <string> waveform-path: "";
+    in property <bool> has-waveform: false;
     in-out property <float> playhead-position: 0.0;  // 0.0 to 1.0
     in property <float> zoom: 1.0;
     in property <float> scroll-offset: 0.0;  // 0.0 to 1.0
@@ -134,35 +129,25 @@ component WaveformView inherits Rectangle {
         background: Theme.waveform-center;
     }
 
-    // Waveform bars
-    HorizontalLayout {
-        padding: 2px;
-        spacing: 0px;
-
-        for peak[idx] in root.peaks: Rectangle {
-            horizontal-stretch: 1;
-
-            Rectangle {
-                // Position bar vertically centered based on peak values
-                property <length> center-y: parent.height / 2;
-                property <length> max-amplitude: parent.height / 2 - 4px;
-
-                x: 0;
-                y: center-y - (peak.max * max-amplitude);
-                width: parent.width;
-                height: (peak.max - peak.min) * max-amplitude;
-
-                background: Theme.waveform-fill;
-                border-radius: 1px;
-            }
-        }
+    // Waveform path (single element instead of 500 rectangles)
+    Path {
+        x: 2px;
+        y: 2px;
+        width: parent.width - 4px;
+        height: parent.height - 4px;
+        commands: root.waveform-path;
+        fill: Theme.waveform-fill;
+        viewbox-x: 0;
+        viewbox-y: 0;
+        viewbox-width: 500;
+        viewbox-height: 100;
     }
 
     // Playhead - calculate visual position based on zoom and scroll
     // visual-pos = (absolute-pos - scroll-offset) * zoom
     property <float> view-size: 1.0 / root.zoom;
     property <float> visual-playhead: (root.playhead-position - root.scroll-offset) * root.zoom;
-    property <bool> playhead-visible: root.peaks.length > 0 && visual-playhead >= 0.0 && visual-playhead <= 1.0;
+    property <bool> playhead-visible: root.has-waveform && visual-playhead >= 0.0 && visual-playhead <= 1.0;
 
     if playhead-visible: Rectangle {
         x: max(0px, min(parent.width - 2px, visual-playhead * parent.width - 1px));
@@ -210,7 +195,7 @@ component WaveformView inherits Rectangle {
     }
 
     // Empty state
-    if root.peaks.length == 0: Text {
+    if !root.has-waveform: Text {
         text: "No waveform data";
         color: Theme.text-dimmed;
         font-size: 13px;
@@ -265,9 +250,11 @@ export component MainWindow inherits Window {
     in-out property <PlaybackState> playback: { is-playing: false, is-paused: false, current-track: -1, position: 0, duration: 0, volume: 0.8 };
     in-out property <int> selected-track-index: -1;
     in-out property <string> status-message: "Ready";
-    in property <[WaveformPeak]> waveform-peaks: [];
+    in property <string> waveform-path: "";
+    in property <bool> has-waveform: false;
     in property <string> waveform-duration: "0:00";
     in property <bool> waveform-loading: false;
+    in property <bool> adding-tracks: false;
     in-out property <float> playhead-position: 0.0;
 
     // Currently edited track metadata
@@ -846,7 +833,8 @@ export component MainWindow inherits Window {
 
                         if !root.waveform-loading && root.selected-track-index >= 0: WaveformView {
                             vertical-stretch: 1;
-                            peaks: root.waveform-peaks;
+                            waveform-path: root.waveform-path;
+                            has-waveform: root.has-waveform;
                             playhead-position <=> root.playhead-position;
                             is-playing: root.playback.is-playing;
                             zoom: root.zoom-level;
