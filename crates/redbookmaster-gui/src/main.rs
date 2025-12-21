@@ -149,6 +149,8 @@ struct AppState {
     last_modification_time: Option<std::time::Instant>,
     /// Reference to the tracks VecModel for in-place updates
     tracks_model: Option<Rc<slint::VecModel<TrackData>>>,
+    /// Reusable buffer for peak data to avoid allocation on zoom/scroll
+    peaks_buffer: Vec<(f32, f32)>,
 }
 
 /// Cached waveform data
@@ -253,6 +255,7 @@ impl AppState {
             has_pending_save: false,
             last_modification_time: None,
             tracks_model: None,
+            peaks_buffer: Vec::with_capacity(WAVEFORM_BINS),
         }
     }
 
@@ -401,7 +404,9 @@ impl AppState {
     }
 
     /// Get SVG path for current zoom level and scroll offset for the displayed track
-    fn get_visible_path(&self, width: f32, height: f32) -> String {
+    ///
+    /// Uses a reusable buffer to avoid allocation on each zoom/scroll operation.
+    fn get_visible_path(&mut self, width: f32, height: f32) -> String {
         let Some(track_num) = self.displayed_track_num else {
             return String::new();
         };
@@ -415,13 +420,15 @@ impl AppState {
         let start = self.scroll_offset;
         let end = (start + view_size).min(1.0);
 
-        // Get peaks for the visible range and convert to SVG path
-        let peaks = cache.waveform_data.get_peaks_for_range(start, end, WAVEFORM_BINS);
-        peaks_to_svg_path(&peaks, width, height, true)
+        // Get peaks for the visible range using reusable buffer
+        cache.waveform_data.get_peaks_for_range_into(start, end, WAVEFORM_BINS, &mut self.peaks_buffer);
+        peaks_to_svg_path(&self.peaks_buffer, width, height, true)
     }
 
     /// Get SVG path for a specific track from cache
-    fn get_visible_path_for_track(&self, track_num: u8, width: f32, height: f32) -> String {
+    ///
+    /// Uses a reusable buffer to avoid allocation on each zoom/scroll operation.
+    fn get_visible_path_for_track(&mut self, track_num: u8, width: f32, height: f32) -> String {
         let Some(cache) = self.waveform_cache.peek(&track_num) else {
             return String::new();
         };
@@ -431,9 +438,9 @@ impl AppState {
         let start = self.scroll_offset;
         let end = (start + view_size).min(1.0);
 
-        // Get peaks for the visible range and convert to SVG path
-        let peaks = cache.waveform_data.get_peaks_for_range(start, end, WAVEFORM_BINS);
-        peaks_to_svg_path(&peaks, width, height, true)
+        // Get peaks for the visible range using reusable buffer
+        cache.waveform_data.get_peaks_for_range_into(start, end, WAVEFORM_BINS, &mut self.peaks_buffer);
+        peaks_to_svg_path(&self.peaks_buffer, width, height, true)
     }
 
     /// Check if there's a waveform to display

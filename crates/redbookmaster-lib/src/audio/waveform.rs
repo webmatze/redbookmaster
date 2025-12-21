@@ -32,40 +32,65 @@ impl WaveformData {
 
     /// Get a slice of peaks for a given range (0.0 to 1.0)
     ///
-    /// Uses vectorizable fold pattern for better auto-SIMD optimization
+    /// Uses vectorizable fold pattern for better auto-SIMD optimization.
+    /// Note: This allocates a new Vec. For repeated calls (zoom/scroll),
+    /// use `get_peaks_for_range_into` with a reusable buffer.
     #[inline]
     pub fn get_peaks_for_range(&self, start: f32, end: f32, num_bins: usize) -> Vec<(f32, f32)> {
+        let mut buffer = Vec::with_capacity(num_bins);
+        self.get_peaks_for_range_into(start, end, num_bins, &mut buffer);
+        buffer
+    }
+
+    /// Get peaks for a range, reusing a provided buffer to avoid allocation.
+    ///
+    /// The buffer is cleared and filled with `num_bins` peak values.
+    /// Uses vectorizable fold pattern for better auto-SIMD optimization.
+    #[inline]
+    pub fn get_peaks_for_range_into(
+        &self,
+        start: f32,
+        end: f32,
+        num_bins: usize,
+        buffer: &mut Vec<(f32, f32)>,
+    ) {
+        buffer.clear();
+
         if self.peaks.is_empty() || num_bins == 0 {
-            return vec![(0.0, 0.0); num_bins];
+            buffer.resize(num_bins, (0.0, 0.0));
+            return;
         }
 
         let start_idx = ((start * self.peaks.len() as f32) as usize).min(self.peaks.len() - 1);
         let end_idx = ((end * self.peaks.len() as f32) as usize).min(self.peaks.len());
 
         if start_idx >= end_idx {
-            return vec![(0.0, 0.0); num_bins];
+            buffer.resize(num_bins, (0.0, 0.0));
+            return;
         }
 
         let range_peaks = &self.peaks[start_idx..end_idx];
         let samples_per_bin = range_peaks.len() as f32 / num_bins as f32;
 
-        (0..num_bins)
-            .map(|i| {
-                let bin_start = (i as f32 * samples_per_bin) as usize;
-                let bin_end = (((i + 1) as f32 * samples_per_bin) as usize).min(range_peaks.len());
+        buffer.reserve(num_bins);
 
-                if bin_start >= bin_end {
-                    return (0.0, 0.0);
-                }
+        for i in 0..num_bins {
+            let bin_start = (i as f32 * samples_per_bin) as usize;
+            let bin_end = (((i + 1) as f32 * samples_per_bin) as usize).min(range_peaks.len());
 
+            let peak = if bin_start >= bin_end {
+                (0.0, 0.0)
+            } else {
                 // Use fold pattern which LLVM can auto-vectorize
                 range_peaks[bin_start..bin_end]
                     .iter()
                     .fold((0.0f32, 0.0f32), |(min_acc, max_acc), &(min, max)| {
                         (min_acc.min(min), max_acc.max(max))
                     })
-            })
-            .collect()
+            };
+
+            buffer.push(peak);
+        }
     }
 }
 

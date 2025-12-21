@@ -18,15 +18,6 @@ _All high priority items completed - see Completed section._
 
 ## Priority 3 - Medium (Optimization Opportunities)
 
-### [ ] Reuse allocation in get_peaks_for_range
-**File:** `crates/redbookmaster-lib/src/audio/waveform.rs` (lines 34-73)
-
-**Issue:** Every zoom/scroll operation calls this function, allocating a new vector of peaks.
-
-**Recommendation:** Take a mutable slice as parameter to reuse allocation.
-
----
-
 ### [ ] Reduce track title cloning
 **File:** `crates/redbookmaster-gui/src/main.rs` (lines 192-202)
 
@@ -172,6 +163,18 @@ Optimized peak extraction with auto-vectorizable patterns:
 - **Streaming extraction**: Pre-compute division constants (`inv_max`, `inv_channels`) - multiplications are faster than divisions in the hot path
 - Added `#[inline]` hints to help compiler optimization
 - Note: Explicit SIMD for streaming would require buffering which defeats memory-efficiency; streaming is I/O bound anyway
+
+---
+
+### [x] Reuse allocation in get_peaks_for_range (Priority 3 - Medium)
+**File:** `crates/redbookmaster-lib/src/audio/waveform.rs`, `crates/redbookmaster-gui/src/main.rs`
+
+Implemented allocation reuse for zoom/scroll operations:
+- Added `get_peaks_for_range_into(&self, ..., buffer: &mut Vec<(f32, f32)>)` method that reuses a provided buffer
+- Original `get_peaks_for_range` now delegates to the new method (backwards compatible)
+- Added `peaks_buffer: Vec<(f32, f32)>` field to AppState, pre-allocated with `WAVEFORM_BINS` capacity
+- Updated `get_visible_path` and `get_visible_path_for_track` to use the reusable buffer
+- Eliminates allocation on every zoom/scroll operation
 
 ---
 
