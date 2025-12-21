@@ -18,22 +18,6 @@ _All high priority items completed - see Completed section._
 
 ## Priority 3 - Medium (Optimization Opportunities)
 
-### [ ] Use blocking receive in audio thread when idle
-**File:** `crates/redbookmaster-gui/src/player/engine.rs` (line 206)
-
-**Issue:** The audio thread wakes up every 50ms to check for commands, even when not playing (~20 thread wakeups per second when idle).
-
-**Recommendation:**
-```rust
-let timeout = if state.is_playing.load(Ordering::Relaxed) {
-    Duration::from_millis(50)
-} else {
-    Duration::from_secs(60)  // Long timeout when idle
-};
-```
-
----
-
 ### [ ] Reduce position update frequency
 **File:** `crates/redbookmaster-gui/src/player/engine.rs` (lines 458-460)
 
@@ -172,6 +156,17 @@ Replaced 500 individual Rectangle elements with a single Path element:
 - Viewbox mapping (500x100) scales path to actual element size
 - Reduced layout calculations, property bindings, and rendering overhead
 - Removed unused `WaveformPeak` struct from Slint
+
+---
+
+### [x] Use dynamic timeout in audio thread when idle (Priority 3 - Medium)
+**File:** `crates/redbookmaster-gui/src/player/engine.rs`
+
+Implemented dynamic timeout based on playback state:
+- When playing: 50ms timeout for responsive position updates
+- When idle/paused: 1 second timeout to reduce thread wakeups
+- Reduces idle thread wakeups from 20/second to 1/second (95% reduction)
+- Commands are still processed immediately when received
 
 ---
 

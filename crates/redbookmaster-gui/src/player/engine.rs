@@ -202,8 +202,16 @@ fn audio_thread(
     let mut pause_offset_ms: u64 = 0;
 
     loop {
+        // Use shorter timeout when playing for responsive position updates,
+        // longer timeout when idle to reduce thread wakeups
+        let timeout = if state.is_playing.load(Ordering::Relaxed) && !state.is_paused.load(Ordering::Relaxed) {
+            Duration::from_millis(50)
+        } else {
+            Duration::from_secs(1)
+        };
+
         // Process commands (non-blocking with timeout)
-        match command_rx.recv_timeout(Duration::from_millis(50)) {
+        match command_rx.recv_timeout(timeout) {
             Ok(PlayerCommand::Load(path)) => {
                 // Stop current playback by dropping old sink and creating new one
                 drop(sink.take());
